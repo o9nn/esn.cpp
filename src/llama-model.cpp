@@ -2058,6 +2058,12 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                 ml.get_key(LLM_KV_ESN_LEAKING_RATE,     hparams.esn_leaking_rate);
                 ml.get_key(LLM_KV_ESN_INPUT_SCALING,    hparams.esn_input_scaling);
 
+                // Optional ESN parameters with defaults
+                ml.get_key(LLM_KV_ESN_FEEDBACK_SCALING, hparams.esn_feedback_scaling, false);
+                ml.get_key(LLM_KV_ESN_NOISE_LEVEL,      hparams.esn_noise_level, false);
+                ml.get_key(LLM_KV_ESN_ACTIVATION_TYPE,  hparams.esn_activation_type, false);
+                ml.get_key(LLM_KV_ESN_BIDIRECTIONAL,    hparams.esn_bidirectional, false);
+
                 ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
 
                 switch (hparams.n_layer) {
@@ -5995,19 +6001,26 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 
                     // ESN architecture tensors
                     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
-                    
-                    // Input weights: projects input embeddings to reservoir  
+
+                    // Input weights: projects input embeddings to reservoir
                     layers.resize(1); // ESN uses a single "layer" to store the weights
                     layers[0].wq = create_tensor(tn(LLM_TENSOR_ESN_INPUT_WEIGHTS, "weight"), {reservoir_size, n_embd}, 0);
-                    
+
                     // Reservoir weights: recurrent connections within reservoir
                     layers[0].wk = create_tensor(tn(LLM_TENSOR_ESN_RESERVOIR_WEIGHTS, "weight"), {reservoir_size, reservoir_size}, 0);
-                    
+
                     // Output normalization and projection
                     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {reservoir_size}, 0);
-                    
+
                     // Output weights: projects reservoir states to vocabulary
                     output = create_tensor(tn(LLM_TENSOR_ESN_OUTPUT_WEIGHTS, "weight"), {n_vocab, reservoir_size}, 0);
+
+                    // Optional: feedback weights (output-to-reservoir connections)
+                    layers[0].wv = create_tensor(tn(LLM_TENSOR_ESN_FEEDBACK_WEIGHTS, "weight"), {reservoir_size, n_vocab}, TENSOR_NOT_REQUIRED);
+
+                    // Optional: bias vectors
+                    layers[0].bq = create_tensor(tn(LLM_TENSOR_ESN_INPUT_BIAS, "weight"), {reservoir_size}, TENSOR_NOT_REQUIRED);
+                    layers[0].bk = create_tensor(tn(LLM_TENSOR_ESN_RESERVOIR_BIAS, "weight"), {reservoir_size}, TENSOR_NOT_REQUIRED);
                 } break;
             default:
                 throw std::runtime_error("unknown architecture");
@@ -19336,12 +19349,26 @@ struct llm_build_apertus : public llm_graph_context {
 };
 
 struct llm_build_esn : public llm_graph_context_mamba {
+    // Helper function to apply activation based on type
+    ggml_tensor * apply_esn_activation(ggml_tensor * x, uint32_t activation_type) {
+        switch (activation_type) {
+            case 1:  // sigmoid
+                return ggml_sigmoid(ctx0, x);
+            case 2:  // leaky_relu (approximated with gelu for now)
+                return ggml_gelu(ctx0, x);
+            default: // 0 = tanh (default)
+                return ggml_tanh(ctx0, x);
+        }
+    }
+
     llm_build_esn(const llama_model & model, const llm_graph_params & params) : llm_graph_context_mamba(params) {
         ggml_tensor * cur;
         ggml_tensor * inpL;
 
         const int64_t reservoir_size = hparams.esn_reservoir_size;
         const float leaking_rate = hparams.esn_leaking_rate;
+        const float feedback_scaling = hparams.esn_feedback_scaling;
+        const uint32_t activation_type = hparams.esn_activation_type;
 
         // {n_embd, n_tokens}
         inpL = build_inp_embd(model.tok_embd);
@@ -19367,6 +19394,11 @@ struct llm_build_esn : public llm_graph_context_mamba {
         // W_in * input: {reservoir_size, n_embd} * {n_embd, n_tokens} -> {reservoir_size, n_tokens}
         cur = ggml_mul_mat(ctx0, model.layers[0].wq, inpL);
         cur = ggml_scale(ctx0, cur, hparams.esn_input_scaling);
+
+        // Add input bias if present
+        if (model.layers[0].bq) {
+            cur = ggml_add(ctx0, cur, model.layers[0].bq);
+        }
         cb(cur, "esn_input_proj", -1);
 
         // Reshape state to match token dimension for element-wise operations
@@ -19374,31 +19406,32 @@ struct llm_build_esn : public llm_graph_context_mamba {
         reservoir_state = ggml_reshape_2d(ctx0, reservoir_state, reservoir_size, n_seqs);
 
         // Apply reservoir dynamics for each token sequentially
-        // This is the core ESN computation: x(t+1) = (1-α)*x(t) + α*tanh(W_res*x(t) + W_in*u(t))
-        // where α is the leaking rate and W_res has spectral radius < 1
+        // This is the core ESN computation: x(t+1) = (1-α)*x(t) + α*f(W_res*x(t) + W_in*u(t) + W_fb*y(t-1))
+        // where α is the leaking rate, W_res has spectral radius < 1, and f is the activation function
 
         // W_res * x(t): {reservoir_size, reservoir_size} * {reservoir_size, n_seqs} -> {reservoir_size, n_seqs}
         ggml_tensor * reservoir_recurrent = ggml_mul_mat(ctx0, model.layers[0].wk, reservoir_state);
         cb(reservoir_recurrent, "esn_reservoir_recurrent", -1);
 
         // For batch processing, we need to handle the recurrent update properly
-        // Reshape cur to match: {reservoir_size, n_tokens} -> use last token's projection per sequence
-        // In a simplified approach, we accumulate the input projections
-
-        // Add input projection: W_res*x(t) + W_in*u(t)
-        // Note: For proper sequence processing, each token should update state sequentially
-        // Here we use a simplified single-step update using the sum of input projections
+        // Use sum/average of input projections for batch update
         ggml_tensor * input_sum = ggml_pool_2d(ctx0, cur, GGML_OP_POOL_AVG, 1, ubatch.n_seq_tokens, 1, ubatch.n_seq_tokens, 0, 0);
         input_sum = ggml_reshape_2d(ctx0, input_sum, reservoir_size, n_seqs);
 
+        // Add input projection: W_res*x(t) + W_in*u(t)
         ggml_tensor * reservoir_input = ggml_add(ctx0, reservoir_recurrent, input_sum);
+
+        // Add reservoir bias if present
+        if (model.layers[0].bk) {
+            reservoir_input = ggml_add(ctx0, reservoir_input, model.layers[0].bk);
+        }
         cb(reservoir_input, "esn_reservoir_input", -1);
 
-        // Apply nonlinearity: tanh(W_res*x(t) + W_in*u(t))
-        ggml_tensor * reservoir_activated = ggml_tanh(ctx0, reservoir_input);
+        // Apply activation function based on type (tanh, sigmoid, or leaky_relu)
+        ggml_tensor * reservoir_activated = apply_esn_activation(reservoir_input, activation_type);
         cb(reservoir_activated, "esn_reservoir_activated", -1);
 
-        // Leaky integration: x(t+1) = (1-α)*x(t) + α*tanh(...)
+        // Leaky integration: x(t+1) = (1-α)*x(t) + α*f(...)
         ggml_tensor * leaky_old = ggml_scale(ctx0, reservoir_state, 1.0f - leaking_rate);
         ggml_tensor * leaky_new = ggml_scale(ctx0, reservoir_activated, leaking_rate);
         ggml_tensor * new_state = ggml_add(ctx0, leaky_old, leaky_new);

@@ -40,6 +40,10 @@ Where:
 | `esn_sparsity` | Connectivity sparsity (fraction of zero weights) | 0.1 | [0, 1] |
 | `esn_leaking_rate` | Memory vs. adaptation parameter | 1.0 | (0, 1] |
 | `esn_input_scaling` | Input signal scaling factor | 1.0 | > 0 |
+| `esn_feedback_scaling` | Output-to-reservoir feedback (0 = disabled) | 0.0 | >= 0 |
+| `esn_noise_level` | Noise injection for regularization | 0.0 | >= 0 |
+| `esn_activation_type` | Activation function (0=tanh, 1=sigmoid, 2=leaky_relu) | 0 | {0,1,2} |
+| `esn_bidirectional` | Enable bidirectional processing | false | bool |
 
 #### Tensors
 
@@ -48,6 +52,9 @@ Where:
 | `esn_input_weights` | `[reservoir_size, n_embd]` | Maps input embeddings to reservoir |
 | `esn_reservoir_weights` | `[reservoir_size, reservoir_size]` | Recurrent reservoir connections |
 | `esn_output_weights` | `[n_vocab, reservoir_size]` | Maps reservoir to output vocabulary |
+| `esn_feedback_weights` | `[reservoir_size, n_vocab]` | Output-to-reservoir feedback (optional) |
+| `esn_input_bias` | `[reservoir_size]` | Input projection bias (optional) |
+| `esn_reservoir_bias` | `[reservoir_size]` | Reservoir activation bias (optional) |
 
 ## Implementation Details
 

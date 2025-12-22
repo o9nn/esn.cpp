@@ -142,6 +142,10 @@ struct llama_hparams {
     float    esn_sparsity         = 0.1f;
     float    esn_leaking_rate     = 1.0f;
     float    esn_input_scaling    = 1.0f;
+    float    esn_feedback_scaling = 0.0f;    // output-to-reservoir feedback (0 = disabled)
+    float    esn_noise_level      = 0.0f;    // noise injection for regularization
+    uint32_t esn_activation_type  = 0;       // 0=tanh, 1=sigmoid, 2=leaky_relu
+    bool     esn_bidirectional    = false;   // bidirectional reservoir processing
 
     float f_clamp_kqv      = 0.0f;
     float f_max_alibi_bias = 0.0f;

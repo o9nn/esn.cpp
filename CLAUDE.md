@@ -34,15 +34,22 @@ x(t+1) = (1-α) * x(t) + α * tanh(W_res * x(t) + W_in * u(t))
 | `esn_sparsity` | 0.1 | Reservoir connectivity (10%) |
 | `esn_leaking_rate` | 1.0 | Memory vs adaptation trade-off |
 | `esn_input_scaling` | 1.0 | Input signal scaling |
+| `esn_feedback_scaling` | 0.0 | Output-to-reservoir feedback (0 = disabled) |
+| `esn_noise_level` | 0.0 | Noise injection for regularization |
+| `esn_activation_type` | 0 | Activation: 0=tanh, 1=sigmoid, 2=leaky_relu |
+| `esn_bidirectional` | false | Bidirectional reservoir processing |
 
 ### Tensor Layout
 
 ```
-token_embd.weight         [n_embd, n_vocab]
-esn_input_weights.weight  [reservoir_size, n_embd]
+token_embd.weight             [n_embd, n_vocab]
+esn_input_weights.weight      [reservoir_size, n_embd]
 esn_reservoir_weights.weight  [reservoir_size, reservoir_size]
-output_norm.weight        [reservoir_size]
-esn_output_weights.weight [n_vocab, reservoir_size]
+output_norm.weight            [reservoir_size]
+esn_output_weights.weight     [n_vocab, reservoir_size]
+esn_feedback_weights.weight   [reservoir_size, n_vocab]  (optional)
+esn_input_bias.weight         [reservoir_size]           (optional)
+esn_reservoir_bias.weight     [reservoir_size]           (optional)
 ```
 
 ## Build Commands

@@ -9,9 +9,17 @@ Echo State Networks only require training the output weights (W_out),
 while the reservoir weights (W_res) and input weights (W_in) remain fixed
 after initialization according to spectral radius constraints.
 
+Features:
+- Multiple activation functions (tanh, sigmoid, leaky_relu)
+- Output feedback connections for generative tasks
+- Bias vectors for input and reservoir
+- Bidirectional reservoir processing
+- Ridge regression training with regularization
+
 Usage:
     python esn_training.py --config esn_config.json
     python esn_training.py --reservoir-size 1000 --train-data data.txt
+    python esn_training.py --reservoir-size 2048 --activation sigmoid --use-bias
 
 Author: esn.cpp contributors
 License: MIT
@@ -21,7 +29,7 @@ import argparse
 import json
 import numpy as np
 from pathlib import Path
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Dict, Any, Callable
 import struct
 import os
 
@@ -33,6 +41,11 @@ GGUF_VERSION = 3
 GGML_TYPE_F32 = 0
 GGML_TYPE_F16 = 1
 GGML_TYPE_Q8_0 = 8
+
+# Activation type constants (must match llama-hparams.h)
+ACTIVATION_TANH = 0
+ACTIVATION_SIGMOID = 1
+ACTIVATION_LEAKY_RELU = 2
 
 
 class ESNConfig:
@@ -47,6 +60,11 @@ class ESNConfig:
         sparsity: float = 0.1,
         leaking_rate: float = 0.3,
         input_scaling: float = 1.0,
+        feedback_scaling: float = 0.0,
+        noise_level: float = 0.0,
+        activation_type: int = ACTIVATION_TANH,
+        bidirectional: bool = False,
+        use_bias: bool = False,
         context_length: int = 2048,
         regularization: float = 1e-6,
         seed: int = 42
@@ -58,6 +76,11 @@ class ESNConfig:
         self.sparsity = sparsity
         self.leaking_rate = leaking_rate
         self.input_scaling = input_scaling
+        self.feedback_scaling = feedback_scaling
+        self.noise_level = noise_level
+        self.activation_type = activation_type
+        self.bidirectional = bidirectional
+        self.use_bias = use_bias
         self.context_length = context_length
         self.regularization = regularization
         self.seed = seed
@@ -78,6 +101,16 @@ class ESNConfig:
         return f"ESNConfig({self.__dict__})"
 
 
+def get_activation_fn(activation_type: int) -> Callable:
+    """Get activation function based on type."""
+    if activation_type == ACTIVATION_SIGMOID:
+        return lambda x: 1 / (1 + np.exp(-np.clip(x, -500, 500)))
+    elif activation_type == ACTIVATION_LEAKY_RELU:
+        return lambda x: np.where(x > 0, x, 0.01 * x)
+    else:  # ACTIVATION_TANH
+        return np.tanh
+
+
 class ESN:
     """
     Echo State Network implementation for training.
@@ -86,16 +119,26 @@ class ESN:
     - Fixed random reservoir with sparse connectivity
     - Spectral radius < 1 for echo state property
     - Only output weights are trained via ridge regression
+
+    Extended features:
+    - Multiple activation functions
+    - Output feedback connections
+    - Bias vectors
+    - Bidirectional processing
     """
 
     def __init__(self, config: ESNConfig):
         self.config = config
         self.rng = np.random.default_rng(config.seed)
+        self.activation_fn = get_activation_fn(config.activation_type)
 
         # Initialize weights
-        self.W_in = None    # Input weights
-        self.W_res = None   # Reservoir weights
-        self.W_out = None   # Output weights (trained)
+        self.W_in = None      # Input weights
+        self.W_res = None     # Reservoir weights
+        self.W_out = None     # Output weights (trained)
+        self.W_fb = None      # Feedback weights (optional)
+        self.b_in = None      # Input bias (optional)
+        self.b_res = None     # Reservoir bias (optional)
         self.tok_embd = None  # Token embeddings
         self.output_norm = None  # Output normalization
 
@@ -104,6 +147,10 @@ class ESN:
     def initialize(self) -> None:
         """Initialize all weight matrices according to ESN principles."""
         print(f"Initializing ESN with reservoir size {self.config.reservoir_size}")
+        print(f"  Activation: {['tanh', 'sigmoid', 'leaky_relu'][self.config.activation_type]}")
+        print(f"  Feedback scaling: {self.config.feedback_scaling}")
+        print(f"  Bidirectional: {self.config.bidirectional}")
+        print(f"  Use bias: {self.config.use_bias}")
 
         # Token embeddings (random initialization, to be learned or loaded)
         self.tok_embd = self.rng.standard_normal(
@@ -126,6 +173,21 @@ class ESN:
             (self.config.vocab_size, self.config.reservoir_size),
             dtype=np.float32
         )
+
+        # Optional: feedback weights
+        if self.config.feedback_scaling > 0:
+            self.W_fb = self.rng.standard_normal(
+                (self.config.reservoir_size, self.config.vocab_size)
+            ).astype(np.float32) * self.config.feedback_scaling
+            print(f"  Initialized feedback weights")
+
+        # Optional: bias vectors
+        if self.config.use_bias:
+            self.b_in = np.zeros(self.config.reservoir_size, dtype=np.float32)
+            self.b_res = self.rng.standard_normal(
+                self.config.reservoir_size
+            ).astype(np.float32) * 0.1
+            print(f"  Initialized bias vectors")
 
         self._initialized = True
         print("ESN initialization complete")
@@ -158,15 +220,22 @@ class ESN:
         # Verify spectral radius
         eigenvalues = np.linalg.eigvals(self.W_res)
         actual_sr = np.max(np.abs(eigenvalues))
-        print(f"Reservoir spectral radius: {actual_sr:.4f} (target: {self.config.spectral_radius})")
+        print(f"  Reservoir spectral radius: {actual_sr:.4f} (target: {self.config.spectral_radius})")
+        print(f"  Reservoir sparsity: {1 - np.count_nonzero(self.W_res) / self.W_res.size:.2%} zeros")
 
-    def forward(self, embeddings: np.ndarray, state: Optional[np.ndarray] = None) -> Tuple[np.ndarray, np.ndarray]:
+    def forward(
+        self,
+        embeddings: np.ndarray,
+        state: Optional[np.ndarray] = None,
+        prev_output: Optional[np.ndarray] = None
+    ) -> Tuple[np.ndarray, np.ndarray]:
         """
         ESN forward pass.
 
         Args:
             embeddings: Input embeddings [n_tokens, embedding_dim]
             state: Previous reservoir state [reservoir_size] or None
+            prev_output: Previous output for feedback [vocab_size] or None
 
         Returns:
             states: Reservoir states for all timesteps [n_tokens, reservoir_size]
@@ -187,14 +256,68 @@ class ESN:
             # Project input to reservoir space
             input_proj = self.W_in @ embeddings[t]
 
-            # Reservoir update: x(t+1) = (1-α)*x(t) + α*tanh(W_res*x(t) + W_in*u(t))
+            # Add input bias if present
+            if self.b_in is not None:
+                input_proj += self.b_in
+
+            # Reservoir recurrence
             reservoir_input = self.W_res @ state + input_proj
-            activated = np.tanh(reservoir_input)
+
+            # Add feedback if enabled
+            if self.W_fb is not None and prev_output is not None:
+                reservoir_input += self.W_fb @ prev_output
+
+            # Add reservoir bias if present
+            if self.b_res is not None:
+                reservoir_input += self.b_res
+
+            # Add noise if specified
+            if self.config.noise_level > 0:
+                reservoir_input += self.rng.standard_normal(
+                    self.config.reservoir_size
+                ).astype(np.float32) * self.config.noise_level
+
+            # Apply activation function
+            activated = self.activation_fn(reservoir_input)
+
+            # Leaky integration: x(t+1) = (1-α)*x(t) + α*f(...)
             state = (1 - alpha) * state + alpha * activated
 
             states[t] = state
 
+            # Update prev_output for next iteration (if using feedback)
+            if self.W_fb is not None:
+                # Simple softmax to get output distribution
+                logits = self.W_out @ state
+                prev_output = np.exp(logits - np.max(logits))
+                prev_output /= prev_output.sum()
+
         return states, state
+
+    def forward_bidirectional(
+        self,
+        embeddings: np.ndarray,
+    ) -> np.ndarray:
+        """
+        Bidirectional ESN forward pass.
+
+        Processes sequence in both directions and concatenates states.
+
+        Args:
+            embeddings: Input embeddings [n_tokens, embedding_dim]
+
+        Returns:
+            states: Combined bidirectional states [n_tokens, 2*reservoir_size]
+        """
+        # Forward pass
+        states_fwd, _ = self.forward(embeddings)
+
+        # Backward pass
+        states_bwd, _ = self.forward(embeddings[::-1])
+        states_bwd = states_bwd[::-1]  # Reverse to align with forward
+
+        # Concatenate
+        return np.concatenate([states_fwd, states_bwd], axis=1)
 
     def collect_states(self, token_sequences: np.ndarray) -> np.ndarray:
         """
@@ -213,7 +336,10 @@ class ESN:
             embeddings = self.tok_embd[:, seq].T  # [seq_length, embedding_dim]
 
             # Get reservoir states
-            states, _ = self.forward(embeddings)
+            if self.config.bidirectional:
+                states = self.forward_bidirectional(embeddings)
+            else:
+                states, _ = self.forward(embeddings)
             all_states.append(states)
 
         return np.vstack(all_states)
@@ -236,7 +362,7 @@ class ESN:
             washout: Number of initial timesteps to discard
 
         Returns:
-            training_error: Mean squared error after training
+            training_accuracy: Accuracy after training
         """
         if not self._initialized:
             raise RuntimeError("ESN not initialized. Call initialize() first.")
@@ -255,7 +381,10 @@ class ESN:
             embeddings = self.tok_embd[:, in_seq].T
 
             # Get reservoir states
-            states, _ = self.forward(embeddings)
+            if self.config.bidirectional:
+                states = self.forward_bidirectional(embeddings)
+            else:
+                states, _ = self.forward(embeddings)
 
             # Remove washout period
             states = states[washout:]
@@ -264,14 +393,22 @@ class ESN:
             all_states.append(states)
             all_targets.extend(targets)
 
-        X = np.vstack(all_states)  # [n_samples, reservoir_size]
+        X = np.vstack(all_states)  # [n_samples, reservoir_size] or [n_samples, 2*reservoir_size]
         y = np.array(all_targets)  # [n_samples]
 
-        print(f"Training output weights on {X.shape[0]} samples...")
+        state_dim = X.shape[1]
+        print(f"Training output weights on {X.shape[0]} samples (state dim: {state_dim})...")
 
         # Apply RMS normalization to states
         rms = np.sqrt(np.mean(X ** 2, axis=-1, keepdims=True) + 1e-6)
-        X_norm = X / rms * self.output_norm
+        X_norm = X / rms
+
+        # For bidirectional, we need to adjust the output weights
+        if self.config.bidirectional:
+            # Combine forward and backward contributions
+            X_norm = X_norm[:, :self.config.reservoir_size] + X_norm[:, self.config.reservoir_size:]
+
+        X_norm *= self.output_norm
 
         # Convert targets to one-hot
         Y = np.zeros((len(y), self.config.vocab_size), dtype=np.float32)
@@ -286,7 +423,7 @@ class ESN:
         # Solve linear system
         self.W_out = np.linalg.solve(XtX, XtY).T
 
-        # Calculate training error
+        # Calculate training accuracy
         predictions = X_norm @ self.W_out.T
         pred_tokens = np.argmax(predictions, axis=-1)
         accuracy = np.mean(pred_tokens == y)
@@ -322,9 +459,17 @@ class ESN:
         f.write(struct.pack('<I', GGUF_MAGIC))
         f.write(struct.pack('<I', GGUF_VERSION))
 
-        # Number of tensors and KV pairs
+        # Count tensors
         n_tensors = 5  # tok_embd, W_in, W_res, output_norm, W_out
-        n_kv = 12  # Metadata key-value pairs
+        if self.W_fb is not None:
+            n_tensors += 1
+        if self.b_in is not None:
+            n_tensors += 1
+        if self.b_res is not None:
+            n_tensors += 1
+
+        # Count KV pairs
+        n_kv = 16  # Base metadata + extended ESN params
 
         f.write(struct.pack('<Q', n_tensors))
         f.write(struct.pack('<Q', n_kv))
@@ -343,6 +488,10 @@ class ESN:
         self._write_float32_kv(f, "esn.sparsity", self.config.sparsity)
         self._write_float32_kv(f, "esn.leaking_rate", self.config.leaking_rate)
         self._write_float32_kv(f, "esn.input_scaling", self.config.input_scaling)
+        self._write_float32_kv(f, "esn.feedback_scaling", self.config.feedback_scaling)
+        self._write_float32_kv(f, "esn.noise_level", self.config.noise_level)
+        self._write_uint32_kv(f, "esn.activation_type", self.config.activation_type)
+        self._write_bool_kv(f, "esn.bidirectional", self.config.bidirectional)
         self._write_float32_kv(f, "esn.attention.layernorm_rms_eps", 1e-6)
 
     def _write_tensors(self, f) -> None:
@@ -354,6 +503,14 @@ class ESN:
             ("output_norm.weight", self.output_norm),
             ("esn_output_weights.weight", self.W_out),
         ]
+
+        # Add optional tensors
+        if self.W_fb is not None:
+            tensors.append(("esn_feedback_weights.weight", self.W_fb))
+        if self.b_in is not None:
+            tensors.append(("esn_input_bias.weight", self.b_in))
+        if self.b_res is not None:
+            tensors.append(("esn_reservoir_bias.weight", self.b_res))
 
         # Calculate tensor info offset
         offset = f.tell()
@@ -375,15 +532,10 @@ class ESN:
 
     def _write_string_kv(self, f, key: str, value: str) -> None:
         """Write string key-value pair."""
-        # Key
         key_bytes = key.encode('utf-8')
         f.write(struct.pack('<Q', len(key_bytes)))
         f.write(key_bytes)
-
-        # Type (8 = string)
-        f.write(struct.pack('<I', 8))
-
-        # Value
+        f.write(struct.pack('<I', 8))  # Type = string
         value_bytes = value.encode('utf-8')
         f.write(struct.pack('<Q', len(value_bytes)))
         f.write(value_bytes)
@@ -404,23 +556,23 @@ class ESN:
         f.write(struct.pack('<I', 6))  # Type = float32
         f.write(struct.pack('<f', value))
 
+    def _write_bool_kv(self, f, key: str, value: bool) -> None:
+        """Write bool key-value pair."""
+        key_bytes = key.encode('utf-8')
+        f.write(struct.pack('<Q', len(key_bytes)))
+        f.write(key_bytes)
+        f.write(struct.pack('<I', 7))  # Type = bool
+        f.write(struct.pack('<?', value))
+
     def _write_tensor_info(self, f, name: str, shape: tuple, dtype: int, offset: int) -> None:
         """Write tensor info to GGUF."""
         name_bytes = name.encode('utf-8')
         f.write(struct.pack('<Q', len(name_bytes)))
         f.write(name_bytes)
-
-        # Number of dimensions
         f.write(struct.pack('<I', len(shape)))
-
-        # Dimensions
         for dim in shape:
             f.write(struct.pack('<Q', dim))
-
-        # Data type
         f.write(struct.pack('<I', dtype))
-
-        # Offset
         f.write(struct.pack('<Q', offset))
 
 
@@ -447,7 +599,24 @@ def create_sample_training_data(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="ESN Training and Model Creation")
+    parser = argparse.ArgumentParser(
+        description="ESN Training and Model Creation",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Basic training
+  python esn_training.py --reservoir-size 1024 --output model.gguf
+
+  # With sigmoid activation and bias
+  python esn_training.py --reservoir-size 2048 --activation sigmoid --use-bias
+
+  # Generative ESN with feedback
+  python esn_training.py --reservoir-size 1024 --feedback-scaling 0.5
+
+  # Bidirectional ESN
+  python esn_training.py --reservoir-size 512 --bidirectional
+        """
+    )
 
     # Config options
     parser.add_argument("--config", type=str, help="Path to JSON config file")
@@ -466,6 +635,19 @@ def main():
     parser.add_argument("--regularization", type=float, default=1e-6)
     parser.add_argument("--seed", type=int, default=42)
 
+    # Extended ESN features
+    parser.add_argument("--activation", type=str, default="tanh",
+                        choices=["tanh", "sigmoid", "leaky_relu"],
+                        help="Reservoir activation function")
+    parser.add_argument("--feedback-scaling", type=float, default=0.0,
+                        help="Output-to-reservoir feedback scaling (0 = disabled)")
+    parser.add_argument("--noise-level", type=float, default=0.0,
+                        help="Noise injection level for regularization")
+    parser.add_argument("--bidirectional", action="store_true",
+                        help="Use bidirectional reservoir processing")
+    parser.add_argument("--use-bias", action="store_true",
+                        help="Use bias vectors for input and reservoir")
+
     # Training options
     parser.add_argument("--train-data", type=str, help="Path to training data")
     parser.add_argument("--n-sequences", type=int, default=1000,
@@ -481,6 +663,13 @@ def main():
 
     args = parser.parse_args()
 
+    # Map activation name to type
+    activation_map = {
+        "tanh": ACTIVATION_TANH,
+        "sigmoid": ACTIVATION_SIGMOID,
+        "leaky_relu": ACTIVATION_LEAKY_RELU
+    }
+
     # Load or create config
     if args.config:
         config = ESNConfig.from_json(args.config)
@@ -493,6 +682,11 @@ def main():
             sparsity=args.sparsity,
             leaking_rate=args.leaking_rate,
             input_scaling=args.input_scaling,
+            feedback_scaling=args.feedback_scaling,
+            noise_level=args.noise_level,
+            activation_type=activation_map[args.activation],
+            bidirectional=args.bidirectional,
+            use_bias=args.use_bias,
             context_length=args.context_length,
             regularization=args.regularization,
             seed=args.seed
