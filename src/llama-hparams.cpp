@@ -130,6 +130,11 @@ uint32_t llama_hparams::n_embd_r() const {
 }
 
 uint32_t llama_hparams::n_embd_s() const {
+    if (esn_reservoir_size != 0) {
+        // corresponds to ESN's reservoir state size
+        return esn_reservoir_size;
+    }
+
     if (wkv_head_size != 0) {
         // corresponds to RWKV's wkv_states size
         return n_embd * wkv_head_size;
