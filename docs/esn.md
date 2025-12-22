@@ -40,6 +40,10 @@ Where:
 | `esn_sparsity` | Connectivity sparsity (fraction of zero weights) | 0.1 | [0, 1] |
 | `esn_leaking_rate` | Memory vs. adaptation parameter | 1.0 | (0, 1] |
 | `esn_input_scaling` | Input signal scaling factor | 1.0 | > 0 |
+| `esn_feedback_scaling` | Output-to-reservoir feedback (0 = disabled) | 0.0 | >= 0 |
+| `esn_noise_level` | Noise injection for regularization | 0.0 | >= 0 |
+| `esn_activation_type` | Activation function (0=tanh, 1=sigmoid, 2=leaky_relu) | 0 | {0,1,2} |
+| `esn_bidirectional` | Enable bidirectional processing | false | bool |
 
 #### Tensors
 
@@ -48,6 +52,9 @@ Where:
 | `esn_input_weights` | `[reservoir_size, n_embd]` | Maps input embeddings to reservoir |
 | `esn_reservoir_weights` | `[reservoir_size, reservoir_size]` | Recurrent reservoir connections |
 | `esn_output_weights` | `[n_vocab, reservoir_size]` | Maps reservoir to output vocabulary |
+| `esn_feedback_weights` | `[reservoir_size, n_vocab]` | Output-to-reservoir feedback (optional) |
+| `esn_input_bias` | `[reservoir_size]` | Input projection bias (optional) |
+| `esn_reservoir_bias` | `[reservoir_size]` | Reservoir activation bias (optional) |
 
 ## Implementation Details
 
@@ -242,15 +249,55 @@ Test coverage includes:
 - Recurrent memory integration
 - Forward pass computation
 
+## Training ESN Models
+
+ESN training is provided via a Python utility in `scripts/esn_training.py`:
+
+```bash
+# Install dependencies
+pip install numpy
+
+# Basic training with sample data
+python scripts/esn_training.py --reservoir-size 1024 --output model.gguf
+
+# With custom configuration
+python scripts/esn_training.py --config esn_config.json --output trained.gguf
+
+# Initialize without training (creates random weights)
+python scripts/esn_training.py --init-only --reservoir-size 2048 --output untrained.gguf
+```
+
+### Training Parameters
+
+| Parameter | Flag | Default | Description |
+|-----------|------|---------|-------------|
+| Vocabulary Size | `--vocab-size` | 32000 | Token vocabulary size |
+| Embedding Dim | `--embedding-dim` | 512 | Input embedding dimension |
+| Reservoir Size | `--reservoir-size` | 1024 | Number of reservoir neurons |
+| Spectral Radius | `--spectral-radius` | 0.95 | Reservoir stability parameter |
+| Sparsity | `--sparsity` | 0.1 | Reservoir connectivity fraction |
+| Leaking Rate | `--leaking-rate` | 0.3 | Memory vs adaptation trade-off |
+| Regularization | `--regularization` | 1e-6 | Ridge regression lambda |
+| Washout | `--washout` | 100 | Initial timesteps to discard |
+
+### Training Process
+
+ESN training uses ridge regression on output weights only:
+
+1. **Initialization**: Random reservoir and input weights (fixed)
+2. **State Collection**: Run input sequences through reservoir
+3. **Ridge Regression**: `W_out = Y^T * X * (X^T * X + λI)^(-1)`
+4. **GGUF Export**: Save trained model for llama.cpp inference
+
 ## Future Enhancements
 
 Potential future improvements:
 
-1. **Training Support**: Implement ridge regression for output weight training
-2. **Advanced Initialization**: Proper spectral radius scaling during model creation
-3. **Hierarchical ESNs**: Multi-layer reservoir architectures
-4. **Adaptive Parameters**: Dynamic leaking rate and spectral radius
-5. **Sparse Operations**: Optimized sparse matrix operations for reservoir computation
+1. **Hierarchical ESNs**: Multi-layer reservoir architectures (see `DTECHO.md`)
+2. **Advanced Initialization**: Dynamic spectral radius adaptation
+3. **Adaptive Parameters**: Dynamic leaking rate tuning
+4. **Sparse Operations**: Optimized sparse matrix operations for reservoir computation
+5. **Deep Tree Echo**: Hierarchical AGI architecture exploration
 
 ## References
 

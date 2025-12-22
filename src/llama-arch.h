@@ -273,6 +273,10 @@ enum llm_kv {
     LLM_KV_ESN_SPARSITY,
     LLM_KV_ESN_LEAKING_RATE,
     LLM_KV_ESN_INPUT_SCALING,
+    LLM_KV_ESN_FEEDBACK_SCALING,
+    LLM_KV_ESN_NOISE_LEVEL,
+    LLM_KV_ESN_ACTIVATION_TYPE,
+    LLM_KV_ESN_BIDIRECTIONAL,
 
     // deprecated:
     LLM_KV_TOKENIZER_PREFIX_ID,
@@ -459,6 +463,9 @@ enum llm_tensor {
     LLM_TENSOR_ESN_INPUT_WEIGHTS,
     LLM_TENSOR_ESN_RESERVOIR_WEIGHTS,
     LLM_TENSOR_ESN_OUTPUT_WEIGHTS,
+    LLM_TENSOR_ESN_FEEDBACK_WEIGHTS,    // output-to-reservoir feedback
+    LLM_TENSOR_ESN_INPUT_BIAS,          // reservoir input bias
+    LLM_TENSOR_ESN_RESERVOIR_BIAS,      // reservoir bias
 };
 
 enum llm_tensor_layer {
