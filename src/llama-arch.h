@@ -267,7 +267,7 @@ enum llm_kv {
     LLM_KV_XIELU_BETA,
     LLM_KV_XIELU_EPS,
 
-    // ESN specific parameters
+    // ESN specific parameters – static reservoir configuration
     LLM_KV_ESN_RESERVOIR_SIZE,
     LLM_KV_ESN_SPECTRAL_RADIUS,
     LLM_KV_ESN_SPARSITY,
@@ -277,6 +277,22 @@ enum llm_kv {
     LLM_KV_ESN_NOISE_LEVEL,
     LLM_KV_ESN_ACTIVATION_TYPE,
     LLM_KV_ESN_BIDIRECTIONAL,
+
+    // ESN online learning / infer-train configuration (Phase 3)
+    LLM_KV_ESN_ONLINE_LEARNING_ENABLED,
+    LLM_KV_ESN_ONLINE_LEARNING_RATE,
+    LLM_KV_ESN_ONLINE_REGULARIZATION,
+    LLM_KV_ESN_ONLINE_BUFFER_SIZE,
+    LLM_KV_ESN_ONLINE_UPDATE_MODE,    // 0=batch_ridge, 1=rls, 2=sgd
+    LLM_KV_ESN_ONLINE_DECAY_RATE,
+    LLM_KV_ESN_FREEZE_RESERVOIR,
+    LLM_KV_ESN_REPLAY_WINDOW,
+
+    // ESN hierarchical / Deep Tree Echo configuration (Phase 6)
+    LLM_KV_ESN_N_LEVELS,
+    LLM_KV_ESN_BRANCHING_FACTOR,
+    LLM_KV_ESN_LATERAL_LINKS,
+    LLM_KV_ESN_TOP_DOWN_MOD,
 
     // deprecated:
     LLM_KV_TOKENIZER_PREFIX_ID,

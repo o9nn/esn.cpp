@@ -351,7 +351,7 @@ class ESN:
         washout: int = 100
     ) -> float:
         """
-        Train output weights using ridge regression.
+        Train output weights using batch ridge regression.
 
         This is the key insight of ESNs: only the output layer needs
         to be trained, and it can be done with a simple linear method.
@@ -432,6 +432,183 @@ class ESN:
 
         return accuracy
 
+    # ------------------------------------------------------------------
+    # Online / incremental learning (Phase 3 of ESLLM roadmap)
+    # ------------------------------------------------------------------
+
+    def init_rls(self) -> None:
+        """
+        Initialise the Recursive Least Squares (RLS) online adaptation state.
+
+        Call this once before the first call to ``rls_update()``.
+        The correlation matrix P is set to (1/λ)*I where λ is the
+        regularisation coefficient from config.
+        """
+        rsz = self.config.reservoir_size
+        lam = max(self.config.regularization, 1e-9)
+        # Inverse correlation matrix P:  P = (1/λ) I
+        self._rls_P = np.eye(rsz, dtype=np.float32) * (1.0 / lam)
+        print(f"RLS initialised: reservoir_size={rsz}, λ={lam:.2e}")
+
+    def rls_update(
+        self,
+        reservoir_state: np.ndarray,
+        target_token: int,
+        forgetting_factor: float = 1.0
+    ) -> float:
+        """
+        Perform one online RLS update of the output weights.
+
+        Implements the standard RLS algorithm with forgetting factor λ_f:
+
+            k     = P x / (λ_f + x^T P x)
+            error = e_{target} - W_out^T x          (one-hot error)
+            W_out += error^T k
+            P     = (P - k x^T P) / λ_f
+
+        Args:
+            reservoir_state:  Current reservoir state vector [reservoir_size]
+            target_token:     Ground-truth next token index
+            forgetting_factor: Exponential forgetting rate in (0, 1].
+                               1.0 = no forgetting; <1.0 = faster adaptation.
+
+        Returns:
+            squared_error: Scalar prediction error before update.
+        """
+        if not hasattr(self, '_rls_P'):
+            raise RuntimeError("Call init_rls() before rls_update().")
+
+        x = reservoir_state.reshape(-1, 1).astype(np.float32)  # [R, 1]
+
+        # Compute RLS gain vector
+        Px = self._rls_P @ x                                      # [R, 1]
+        denom = forgetting_factor + float(np.dot(x.ravel(), Px.ravel()))  # scalar
+        k = Px / denom                               # [R, 1]
+
+        # Current logit prediction
+        logits = (self.W_out @ x).ravel()            # [V]
+        target_one_hot = np.zeros_like(logits)
+        target_one_hot[target_token] = 1.0
+
+        # Prediction error before update
+        error = target_one_hot - logits              # [V]
+        sq_error = float(np.dot(error, error))
+
+        # Update output weights: W_out += error^T k  →  outer product
+        self.W_out += np.outer(error, k.ravel())     # [V, R]
+
+        # Update inverse correlation matrix
+        self._rls_P = (self._rls_P - k @ (x.T @ self._rls_P)) / forgetting_factor
+
+        return sq_error
+
+    def sgd_update(
+        self,
+        reservoir_state: np.ndarray,
+        target_token: int,
+        learning_rate: float = 1e-4,
+        weight_decay: float = 0.0
+    ) -> float:
+        """
+        Perform one online SGD update of the output weights (cross-entropy loss).
+
+        Args:
+            reservoir_state: Current reservoir state [reservoir_size]
+            target_token:    Ground-truth next token index
+            learning_rate:   Step size.
+            weight_decay:    L2 regularisation coefficient.
+
+        Returns:
+            cross_entropy_loss: Scalar loss before update.
+        """
+        x = reservoir_state.astype(np.float32)       # [R]
+        logits = self.W_out @ x                      # [V]
+
+        # Softmax
+        logits_shifted = logits - np.max(logits)
+        exp_logits = np.exp(np.clip(logits_shifted, -30, 0))
+        probs = exp_logits / (exp_logits.sum() + 1e-9)
+
+        ce_loss = -float(np.log(probs[target_token] + 1e-9))
+
+        # Gradient of cross-entropy w.r.t. W_out:  grad = (p - e_t) outer x
+        grad = np.outer(probs, x)                    # [V, R]
+        grad[target_token] -= x                      # subtract x for target class
+
+        # Apply update
+        self.W_out -= learning_rate * grad
+        if weight_decay > 0.0:
+            self.W_out -= learning_rate * weight_decay * self.W_out
+
+        return ce_loss
+
+    def online_train_sequence(
+        self,
+        token_sequence: np.ndarray,
+        target_sequence: np.ndarray,
+        mode: str = "rls",
+        learning_rate: float = 1e-4,
+        forgetting_factor: float = 1.0,
+        weight_decay: float = 0.0,
+        washout: int = 0
+    ) -> Dict[str, Any]:
+        """
+        Online training on a single token sequence using the specified mode.
+
+        Supports ``rls`` (Recursive Least Squares) or ``sgd``
+        (Stochastic Gradient Descent).  The reservoir weights are kept fixed.
+
+        Args:
+            token_sequence:   Input token IDs [seq_length]
+            target_sequence:  Target token IDs [seq_length]
+            mode:             ``"rls"`` or ``"sgd"``
+            learning_rate:    Used only for SGD.
+            forgetting_factor: Used only for RLS (exponential forgetting).
+            weight_decay:     L2 penalty (SGD only).
+            washout:          Number of initial steps to skip.
+
+        Returns:
+            stats: Dict with "mean_loss", "n_updates", "final_state".
+        """
+        if not self._initialized:
+            raise RuntimeError("ESN not initialized. Call initialize() first.")
+
+        if mode == "rls" and not hasattr(self, '_rls_P'):
+            self.init_rls()
+
+        embeddings = self.tok_embd[:, token_sequence].T  # [T, E]
+        state = np.zeros(self.config.reservoir_size, dtype=np.float32)
+        losses = []
+
+        for t, (emb, tgt) in enumerate(zip(embeddings, target_sequence)):
+            # Update reservoir state
+            input_proj = self.W_in @ emb
+            if self.b_in is not None:
+                input_proj += self.b_in
+            res_in = self.W_res @ state + input_proj
+            if self.b_res is not None:
+                res_in += self.b_res
+            activated = self.activation_fn(res_in)
+            state = (1 - self.config.leaking_rate) * state + self.config.leaking_rate * activated
+
+            if t < washout:
+                continue
+
+            if mode == "rls":
+                loss = self.rls_update(state, int(tgt), forgetting_factor)
+            elif mode == "sgd":
+                loss = self.sgd_update(state, int(tgt), learning_rate, weight_decay)
+            else:
+                raise ValueError(f"Unknown online training mode: {mode!r}. Use 'rls' or 'sgd'.")
+
+            losses.append(loss)
+
+        return {
+            "mean_loss":   float(np.mean(losses)) if losses else 0.0,
+            "n_updates":   len(losses),
+            "final_state": state.copy(),
+        }
+
     def save_gguf(self, path: str) -> None:
         """
         Save the trained ESN model to GGUF format.
@@ -468,8 +645,10 @@ class ESN:
         if self.b_res is not None:
             n_tensors += 1
 
-        # Count KV pairs
+        # Count KV pairs (base + extended ESN + optional online-learning metadata)
         n_kv = 16  # Base metadata + extended ESN params
+        if getattr(self.config, 'online_learning', False):
+            n_kv += 8  # online learning fields
 
         f.write(struct.pack('<Q', n_tensors))
         f.write(struct.pack('<Q', n_kv))
@@ -493,6 +672,24 @@ class ESN:
         self._write_uint32_kv(f, "esn.activation_type", self.config.activation_type)
         self._write_bool_kv(f, "esn.bidirectional", self.config.bidirectional)
         self._write_float32_kv(f, "esn.attention.layernorm_rms_eps", 1e-6)
+
+        # Optional: online learning configuration metadata (Phase 3)
+        if getattr(self.config, 'online_learning', False):
+            self._write_bool_kv(f,    "esn.online_learning.enabled",  True)
+            self._write_float32_kv(f, "esn.online_learning.rate",
+                                   getattr(self.config, 'online_lr', 1e-4))
+            self._write_float32_kv(f, "esn.online_learning.reg",
+                                   getattr(self.config, 'online_reg', 1e-6))
+            self._write_uint32_kv(f,  "esn.online_learning.buf_size",
+                                   getattr(self.config, 'online_buffer_size', 64))
+            self._write_uint32_kv(f,  "esn.online_learning.mode",
+                                   getattr(self.config, 'online_update_mode', 0))
+            self._write_float32_kv(f, "esn.online_learning.decay",
+                                   getattr(self.config, 'online_decay_rate', 0.0))
+            self._write_bool_kv(f,    "esn.freeze_reservoir",
+                                   getattr(self.config, 'freeze_reservoir', True))
+            self._write_uint32_kv(f,  "esn.replay_window",
+                                   getattr(self.config, 'replay_window', 256))
 
     def _write_tensors(self, f) -> None:
         """Write tensor data to GGUF file."""
@@ -604,7 +801,7 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Basic training
+  # Basic batch ridge regression training
   python esn_training.py --reservoir-size 1024 --output model.gguf
 
   # With sigmoid activation and bias
@@ -615,6 +812,14 @@ Examples:
 
   # Bidirectional ESN
   python esn_training.py --reservoir-size 512 --bidirectional
+
+  # Online RLS training (infer-train / ESLLM)
+  python esn_training.py --reservoir-size 1024 --online --online-mode rls \\
+      --forgetting-factor 0.999 --output online_model.gguf
+
+  # Online SGD training
+  python esn_training.py --reservoir-size 1024 --online --online-mode sgd \\
+      --online-lr 1e-4 --output online_sgd_model.gguf
         """
     )
 
@@ -654,6 +859,24 @@ Examples:
                         help="Number of sequences for sample data")
     parser.add_argument("--seq-length", type=int, default=128)
     parser.add_argument("--washout", type=int, default=100)
+
+    # Online learning options (Phase 3 – ESLLM infer-train substrate)
+    parser.add_argument("--online", action="store_true",
+                        help="Use online incremental training instead of batch ridge regression")
+    parser.add_argument("--online-mode", type=str, default="rls",
+                        choices=["rls", "sgd"],
+                        help="Online learning algorithm: 'rls' (Recursive Least Squares) or 'sgd'")
+    parser.add_argument("--online-lr", type=float, default=1e-4,
+                        help="Learning rate for online SGD training")
+    parser.add_argument("--forgetting-factor", type=float, default=1.0,
+                        help="RLS forgetting factor in (0, 1]; 1.0 = no forgetting")
+    parser.add_argument("--online-reg", type=float, default=1e-6,
+                        help="Regularisation coefficient for online learning initialisation")
+    parser.add_argument("--weight-decay", type=float, default=0.0,
+                        help="L2 weight decay for online SGD")
+    parser.add_argument("--save-online-metadata", action="store_true",
+                        help="Embed online-learning config in GGUF metadata so llama.cpp "
+                             "enables adaptation at runtime")
 
     # Modes
     parser.add_argument("--init-only", action="store_true",
@@ -717,9 +940,60 @@ Examples:
                 config.vocab_size, args.n_sequences, args.seq_length, config.seed
             )
 
-        # Train the model
-        accuracy = esn.train(input_seqs, target_seqs, washout=args.washout)
-        print(f"Final training accuracy: {accuracy:.4f}")
+        if args.online:
+            # ---------------------------------------------------------- #
+            # Online / incremental training (Phase 3 – ESLLM infer-train) #
+            # ---------------------------------------------------------- #
+            print(f"\nOnline training mode: {args.online_mode.upper()}")
+            if args.online_mode == "rls":
+                # Override regularisation for RLS initialisation
+                config.regularization = args.online_reg
+                esn.config.regularization = args.online_reg
+                esn.init_rls()
+
+            total_updates = 0
+            total_loss = 0.0
+            for seq_idx, (in_seq, tgt_seq) in enumerate(zip(input_seqs, target_seqs)):
+                stats = esn.online_train_sequence(
+                    in_seq, tgt_seq,
+                    mode=args.online_mode,
+                    learning_rate=args.online_lr,
+                    forgetting_factor=args.forgetting_factor,
+                    weight_decay=args.weight_decay,
+                    washout=args.washout,
+                )
+                total_updates += stats["n_updates"]
+                total_loss    += stats["mean_loss"] * stats["n_updates"]
+                if seq_idx % 100 == 0:
+                    mean_so_far = total_loss / max(total_updates, 1)
+                    print(f"  Seq {seq_idx}/{len(input_seqs)}  "
+                          f"mean_loss={mean_so_far:.4f}  updates={total_updates}")
+
+            mean_loss = total_loss / max(total_updates, 1)
+            print(f"\nOnline training complete.  "
+                  f"Total updates: {total_updates}  Mean loss: {mean_loss:.4f}")
+
+            # Embed online-learning metadata in the GGUF file if requested
+            if args.save_online_metadata:
+                config.online_learning      = True
+                config.online_lr            = args.online_lr
+                config.online_reg           = args.online_reg
+                config.online_buffer_size   = 64
+                config.online_update_mode   = 0 if args.online_mode == "rls" else 2
+                # decay_rate is the complement of the forgetting factor, clamped to [0, 1)
+                # A forgetting_factor of 1.0 means no forgetting → decay_rate = 0.0
+                # A forgetting_factor approaching 0.0 means fast forgetting → decay_rate approaches 1.0
+                # We clamp to < 1.0 to satisfy the validation constraint.
+                raw_decay = 1.0 - args.forgetting_factor
+                config.online_decay_rate    = min(max(raw_decay, 0.0), 0.9999)
+                config.freeze_reservoir     = True
+                config.replay_window        = 256
+                esn.config = config
+                print("Online learning metadata will be embedded in GGUF.")
+        else:
+            # Batch ridge regression (original mode)
+            accuracy = esn.train(input_seqs, target_seqs, washout=args.washout)
+            print(f"Final training accuracy: {accuracy:.4f}")
 
     # Save to GGUF
     esn.save_gguf(args.output)

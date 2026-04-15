@@ -273,6 +273,22 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_ESN_ACTIVATION_TYPE,   "esn.activation_type"   },
     { LLM_KV_ESN_BIDIRECTIONAL,     "esn.bidirectional"     },
 
+    // Online learning / infer-train
+    { LLM_KV_ESN_ONLINE_LEARNING_ENABLED, "esn.online_learning.enabled"  },
+    { LLM_KV_ESN_ONLINE_LEARNING_RATE,    "esn.online_learning.rate"     },
+    { LLM_KV_ESN_ONLINE_REGULARIZATION,   "esn.online_learning.reg"      },
+    { LLM_KV_ESN_ONLINE_BUFFER_SIZE,      "esn.online_learning.buf_size" },
+    { LLM_KV_ESN_ONLINE_UPDATE_MODE,      "esn.online_learning.mode"     },
+    { LLM_KV_ESN_ONLINE_DECAY_RATE,       "esn.online_learning.decay"    },
+    { LLM_KV_ESN_FREEZE_RESERVOIR,        "esn.freeze_reservoir"         },
+    { LLM_KV_ESN_REPLAY_WINDOW,           "esn.replay_window"            },
+
+    // Hierarchical / Deep Tree Echo
+    { LLM_KV_ESN_N_LEVELS,         "esn.n_levels"          },
+    { LLM_KV_ESN_BRANCHING_FACTOR, "esn.branching_factor"  },
+    { LLM_KV_ESN_LATERAL_LINKS,    "esn.lateral_links"     },
+    { LLM_KV_ESN_TOP_DOWN_MOD,     "esn.top_down_mod"      },
+
     // deprecated
     { LLM_KV_TOKENIZER_PREFIX_ID, "tokenizer.ggml.prefix_token_id" },
     { LLM_KV_TOKENIZER_SUFFIX_ID, "tokenizer.ggml.suffix_token_id" },

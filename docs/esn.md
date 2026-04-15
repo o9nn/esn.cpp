@@ -299,6 +299,57 @@ Potential future improvements:
 4. **Sparse Operations**: Optimized sparse matrix operations for reservoir computation
 5. **Deep Tree Echo**: Hierarchical AGI architecture exploration
 
+## ESLLM: Synchronous Infer-Train Architecture
+
+`esn.cpp` is evolving towards a fully adaptive **ESLLM** (Echo State Language Model) capable of learning from every interaction in real time. See `docs/esllm-roadmap.md` for the complete multi-phase implementation roadmap.
+
+### Key Concepts
+
+**Synchronous infer-train**: A generation step that atomically interleaves inference with online readout adaptation:
+
+```
+Token t arrives
+    │
+    ├─► [Infer step]  Forward pass → reservoir state x(t) → logits
+    │
+    ├─► [Feedback]    Optional feedback event (correction, reward, tool result)
+    │                 accumulated in bounded replay buffer
+    │
+    └─► [Train step]  Online update of W_out only (O(R²), < 1 ms)
+                      Reservoir weights W_res and W_in are NEVER modified
+```
+
+**Proprioceptive feedback**: Signals originating from the model's own execution context:
+- `CORRECTION` — explicit user or verifier correction
+- `REWARD` — scalar RL-style reward/penalty
+- `CONFIDENCE` — model's softmax entropy (self-supervised)
+- `TOOL_RESULT` — structured outcome of a function call
+- `LATENCY` — observed generation latency
+
+### ESLLM Invariants
+
+| Invariant | Guarantee |
+|-----------|-----------|
+| Bounded latency | Train step completes in < 1 ms for R ≤ 4096 on CPU |
+| Stable dynamics | Spectral radius validated to be in (0, 1) at load time |
+| Non-destructive | Only W_out is adapted; W_res, W_in are read-only |
+| Reproducible | State + W_out can be checkpointed and restored at any time |
+| Safe | Updates bounded by L2 regularisation; drift detection + rollback available |
+
+### Capability Matrix
+
+| Capability | Status |
+|-----------|--------|
+| Single-layer ESN inference | ✅ |
+| Parameter validation at load | ✅ |
+| Online RLS/SGD (Python) | ✅ |
+| Online learning GGUF metadata | ✅ |
+| Proprioceptive feedback API (C stubs) | ✅ |
+| Synchronous infer-train runtime loop | 🔄 Phase 4 |
+| Hierarchical reservoir (DTE) | 🔄 Phase 6 |
+| ESN–Transformer hybrid | 🔄 Phase 7 |
+| Safety governance + rollback | 🔄 Phase 8 |
+
 ## References
 
 1. Jaeger, H. (2001). The "echo state" approach to analysing and training recurrent neural networks. GMD Technical Report 148.
