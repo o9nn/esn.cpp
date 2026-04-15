@@ -183,25 +183,56 @@ The base ESN implementation in esn.cpp provides:
 ### Roadmap to Deep Tree Echo
 
 ```
-Phase 1: Hierarchical ESN (Current Focus)
-├── Multi-layer reservoir stacking
-├── Inter-layer connections
-└── Hierarchical state management
+Phase 1: Foundation ✅
+├── ESLLM contract & invariant definitions
+├── Capability matrix (current vs target)
+└── Documentation baseline
 
-Phase 2: Tree Structure
-├── Branching architectures
-├── Lateral connections
-└── Top-down modulation
+Phase 2: Hardened Baseline ✅
+├── 23 comprehensive tests in tests/test-esn.cpp
+├── validate_esn_params() at model load time
+└── Full parameter bounds checking
 
-Phase 3: Cognitive Modules
-├── Memory systems
-├── Attention mechanisms
-└── Goal representation
+Phase 3: Online Learning Primitives ✅
+├── esn_online_* hyperparameters (GGUF + hparams)
+├── RLS and SGD algorithms in scripts/esn_training.py
+└── llama_esn_feedback_event / llama_esn_online_params API stubs
 
-Phase 4: AGI Integration
-├── Continuous learning
-├── Self-modeling
-└── Meta-cognition
+Phase 4: Synchronous Infer-Train Loop 🔄
+├── esn_online_state in llama_context
+├── train-step hook after llama_decode()
+└── Scheduling modes (none / alternating / event-triggered)
+
+Phase 5: Proprioceptive Feedback Channel 🔄
+├── server REST endpoints for feedback/adapt/reset
+├── Per-session and global feedback routing
+└── Privacy gates and rate limiting
+
+Phase 6: Hierarchical ESN (Current DTE Focus) 🔄
+├── esn_n_levels / esn_branching_factor hparams ✅
+├── LLM_TENSOR_ESN_HIER_* tensor types
+├── llm_build_dte graph builder
+└── Hierarchical state management in llama_memory_recurrent
+
+Phase 7: ESN–LLM Hybrid Architecture 🔄
+├── LLM_ARCH_ESN_HYBRID enum
+├── ESN front-end + Transformer/SSM back-end
+└── Bidirectional information flow
+
+Phase 8: Safety & Governance 🔄
+├── Drift detection and update clipping
+├── Rollback to golden checkpoint
+└── Adaptation policy controls
+
+Phase 9: Research Evaluation Stack 🔄
+├── Benchmark suites (adaptation, retention, forgetting)
+├── ESN-specific metrics (state entropy, spectral margin)
+└── Automated per-PR reporting
+
+Phase 10: Productization 🔄
+├── Full llama.h API surface
+├── Server documentation
+└── CI integration
 ```
 
 ### Proposed Extensions

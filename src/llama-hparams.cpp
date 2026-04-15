@@ -2,6 +2,8 @@
 
 #include "ggml.h"
 #include <cassert>
+#include <stdexcept>
+#include <string>
 
 void llama_hparams::set_swa_pattern(uint32_t n_pattern, bool dense_first) {
     if (dense_first) {
@@ -219,4 +221,92 @@ bool llama_hparams::is_masked_swa(uint32_t n_swa, llama_swa_type swa_type, llama
     }
 
     return false;
+}
+
+void llama_hparams::validate_esn_params() const {
+    // reservoir_size must be set to a positive value for a valid ESN model
+    if (esn_reservoir_size == 0) {
+        throw std::invalid_argument("ESN: esn_reservoir_size must be > 0");
+    }
+
+    // spectral_radius must be in (0, 1) to guarantee the echo state property
+    if (esn_spectral_radius <= 0.0f || esn_spectral_radius >= 1.0f) {
+        throw std::invalid_argument(
+            "ESN: esn_spectral_radius must be in (0, 1), got " +
+            std::to_string(esn_spectral_radius));
+    }
+
+    // sparsity must be in [0, 1]
+    if (esn_sparsity < 0.0f || esn_sparsity > 1.0f) {
+        throw std::invalid_argument(
+            "ESN: esn_sparsity must be in [0, 1], got " +
+            std::to_string(esn_sparsity));
+    }
+
+    // leaking_rate must be in (0, 1]
+    if (esn_leaking_rate <= 0.0f || esn_leaking_rate > 1.0f) {
+        throw std::invalid_argument(
+            "ESN: esn_leaking_rate must be in (0, 1], got " +
+            std::to_string(esn_leaking_rate));
+    }
+
+    // input_scaling must be positive
+    if (esn_input_scaling <= 0.0f) {
+        throw std::invalid_argument(
+            "ESN: esn_input_scaling must be > 0, got " +
+            std::to_string(esn_input_scaling));
+    }
+
+    // feedback_scaling must be non-negative
+    if (esn_feedback_scaling < 0.0f) {
+        throw std::invalid_argument(
+            "ESN: esn_feedback_scaling must be >= 0, got " +
+            std::to_string(esn_feedback_scaling));
+    }
+
+    // noise_level must be non-negative
+    if (esn_noise_level < 0.0f) {
+        throw std::invalid_argument(
+            "ESN: esn_noise_level must be >= 0, got " +
+            std::to_string(esn_noise_level));
+    }
+
+    // activation_type: 0=tanh, 1=sigmoid, 2=leaky_relu
+    if (esn_activation_type > 2) {
+        throw std::invalid_argument(
+            "ESN: esn_activation_type must be 0 (tanh), 1 (sigmoid), or 2 (leaky_relu), got " +
+            std::to_string(esn_activation_type));
+    }
+
+    // Online learning: learning rate and regularization must be positive when enabled
+    if (esn_online_learning) {
+        if (esn_online_lr <= 0.0f) {
+            throw std::invalid_argument(
+                "ESN: esn_online_lr must be > 0 when online learning is enabled, got " +
+                std::to_string(esn_online_lr));
+        }
+        if (esn_online_reg < 0.0f) {
+            throw std::invalid_argument(
+                "ESN: esn_online_reg must be >= 0, got " +
+                std::to_string(esn_online_reg));
+        }
+        if (esn_online_update_mode > 2) {
+            throw std::invalid_argument(
+                "ESN: esn_online_update_mode must be 0 (batch_ridge), 1 (rls), or 2 (sgd), got " +
+                std::to_string(esn_online_update_mode));
+        }
+        if (esn_online_decay_rate < 0.0f || esn_online_decay_rate >= 1.0f) {
+            throw std::invalid_argument(
+                "ESN: esn_online_decay_rate must be in [0, 1), got " +
+                std::to_string(esn_online_decay_rate));
+        }
+    }
+
+    // Hierarchical parameters
+    if (esn_n_levels == 0) {
+        throw std::invalid_argument("ESN: esn_n_levels must be >= 1");
+    }
+    if (esn_n_levels > 1 && esn_branching_factor == 0) {
+        throw std::invalid_argument("ESN: esn_branching_factor must be >= 1 for hierarchical ESN (n_levels > 1)");
+    }
 }
