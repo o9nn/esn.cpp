@@ -75,16 +75,31 @@ int main(int argc, char ** argv) {
         return EXIT_FAILURE;
     }
 
-    // Feed tokens one at a time — this is the natural recurrent-inference
-    // pattern. The ESN builder processes one update per sequence per decode
-    // call, which matches a single-token batch exactly.
-    const std::vector<llama_token> input_tokens = { 1, 2, 3, 4 };
-    for (auto id : input_tokens) {
-        llama_token t = (llama_token) ((int32_t) id % n_vocab);
-        llama_batch batch = llama_batch_get_one(&t, 1);
-        const int rc = llama_decode(ctx, batch);
-        if (rc != 0) {
-            fprintf(stderr, "FAIL: llama_decode returned %d\n", rc);
+    // Feed a multi-token prompt in a single batch. The ESN forward pass
+    // unrolls the recurrence over n_seq_tokens, so this exercises the
+    // per-token update path (NOT the single-token-at-a-time workaround).
+    std::vector<llama_token> prompt = { 1, 2, 3, 4 };
+    for (auto & t : prompt) {
+        t = (llama_token) ((int32_t) t % n_vocab);
+    }
+    llama_batch batch = llama_batch_get_one(prompt.data(), (int32_t) prompt.size());
+
+    const int rc = llama_decode(ctx, batch);
+    if (rc != 0) {
+        fprintf(stderr, "FAIL: llama_decode (prompt) returned %d\n", rc);
+        llama_free(ctx);
+        llama_model_free(model);
+        return EXIT_FAILURE;
+    }
+
+    // Follow up with a single-token decode to verify state continuity
+    // across ubatches (the single-token path through llm_build_esn).
+    {
+        llama_token last = (llama_token) (5 % n_vocab);
+        llama_batch step = llama_batch_get_one(&last, 1);
+        const int rc2 = llama_decode(ctx, step);
+        if (rc2 != 0) {
+            fprintf(stderr, "FAIL: llama_decode (step) returned %d\n", rc2);
             llama_free(ctx);
             llama_model_free(model);
             return EXIT_FAILURE;
@@ -116,8 +131,9 @@ int main(int argc, char ** argv) {
     // might legitimately produce zeros (W_out initialized to zero), but
     // we at least want to see the computation ran.
     fprintf(stderr,
-            "test-esn-inference: decoded %zu tokens, got %d-dim logits (%d finite, %d nonzero)\n",
-            input_tokens.size(), n_vocab, n_finite, n_nonzero);
+            "test-esn-inference: decoded %zu-token prompt + 1-token step, "
+            "got %d-dim logits (%d finite, %d nonzero)\n",
+            prompt.size(), n_vocab, n_finite, n_nonzero);
 
     llama_free(ctx);
     llama_model_free(model);

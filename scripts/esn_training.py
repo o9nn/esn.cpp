@@ -175,11 +175,17 @@ class ESN:
         # Output normalization (RMS norm weights)
         self.output_norm = np.ones(self.config.reservoir_size, dtype=np.float32)
 
-        # Output weights: initialized to zero, will be trained
-        self.W_out = np.zeros(
-            (self.config.vocab_size, self.config.reservoir_size),
-            dtype=np.float32
-        )
+        # Output weights: in a proper ESN these are the ONLY trainable
+        # parameters and are typically fitted via ridge regression on
+        # collected reservoir states. We seed them with small random values
+        # so an un-trained model still produces non-zero logits and the end-
+        # to-end inference path can be smoke-tested without first running a
+        # full training pass. Ridge regression (see .train()) overwrites
+        # them with the fitted values, so this initial seed has no effect
+        # once the model is trained.
+        self.W_out = self.rng.standard_normal(
+            (self.config.vocab_size, self.config.reservoir_size)
+        ).astype(np.float32) * 0.02
 
         # Optional: feedback weights
         if self.config.feedback_scaling > 0:

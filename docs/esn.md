@@ -278,23 +278,47 @@ python scripts/esn_training.py \
     --activation tanh \
     --output esn-model.gguf
 
-# 2. Build llama-cli with ESN support.
+# 2. Build llama-cli (and the ESN inference smoke test).
 cmake -B build
-cmake --build build --target llama-cli -j
+cmake --build build -j --target llama-cli test-esn-inference
 
-# 3. Run inference against the trained model.
-build/bin/llama-cli -m esn-model.gguf -p "Hello" -n 32
+# 3. Verify the pipeline on raw token IDs (no tokenizer needed).
+build/bin/test-esn-inference esn-model.gguf
 ```
 
-Notes:
-- The GGUF produced by `scripts/esn_training.py` carries all ESN hyperparameters
-  (reservoir size, spectral radius, sparsity, leaking rate, activation type,
-  feedback scaling, optional biases) as metadata; `llm_build_esn` reads them at
-  load time.
-- Inference-time features consumed by the C++ graph: activation choice,
-  feedback (when `esn_feedback_scaling > 0` and `esn_feedback_weights` are in
-  the GGUF), input bias, reservoir bias, leaky integration.
-- Training-time-only features: noise injection, bidirectional reservoir
+### Tokenizer
+
+By design, `scripts/esn_training.py` writes `tokenizer.ggml.model = "no_vocab"`.
+That tells llama.cpp to allocate the full vocab as dummy entries, which keeps
+the model loadable and lets you drive inference via raw token IDs
+(`llama_batch_get_one` with `llama_token` values, as in
+`tests/test-esn-inference.cpp`). It does **not** support text-prompt
+tokenization — `llama-cli -p "..."` will abort with
+`Tokenizer not initialized` on a no-vocab model.
+
+To do text-prompt inference, replace the stub with a real tokenizer. The
+simplest route is to copy the tokenizer section from an existing GGUF whose
+vocabulary size matches `esn.vocab_size`:
+
+```bash
+# Example: paste the tokenizer from llama-2.gguf into your ESN GGUF
+#   gguf-py/scripts/gguf_set_metadata.py has helpers for this
+python gguf-py/gguf/scripts/gguf_dump.py source-model.gguf \
+    | grep tokenizer
+```
+
+Then either (a) rewrite `scripts/esn_training.py` to call
+`writer.add_tokenizer_model(...)`, `writer.add_token_list(...)`,
+`writer.add_token_scores(...)`, and `writer.add_token_types(...)` with the
+tokenizer data, or (b) merge the tokenizer tensors in with
+`gguf_new_metadata.py`.
+
+### Hyperparameter split: inference-time vs training-time
+
+- Inference-time (consumed by `llm_build_esn`): activation choice, feedback
+  (when `esn_feedback_scaling > 0` and `esn_feedback_weights` are in the GGUF),
+  input bias, reservoir bias, leaky integration, input scaling.
+- Training-time-only: noise injection, bidirectional reservoir
   initialization, spectral radius scaling, sparsity masking.
 
 ## Testing
