@@ -2,6 +2,10 @@
 
 This document describes the implementation of Echo State Networks (ESNs) in llama.cpp, providing a comprehensive model for reservoir computing within the ggml framework.
 
+> **See also:** [`docs/esn-completion.md`](esn-completion.md) — the explicit
+> completion contract for the ESN work: scope, criteria, and the exact
+> file / test / measurement that satisfies each criterion.
+
 ## What are Echo State Networks?
 
 Echo State Networks are a type of recurrent neural network that belongs to the reservoir computing paradigm. ESNs consist of three main components:
