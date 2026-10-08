@@ -264,6 +264,39 @@ ESN models integrate seamlessly with:
 - **llama-quantize**: Model quantization
 - **Python bindings**: Through llama-cpp-python
 
+## End-to-End Usage
+
+The full pipeline from an untrained reservoir to running inference:
+
+```bash
+# 1. Train (or just initialize) an ESN model and export as GGUF.
+#    See "Training ESN Models" below for all flags.
+python scripts/esn_training.py \
+    --reservoir-size 1024 \
+    --spectral-radius 0.95 \
+    --leaking-rate 0.3 \
+    --activation tanh \
+    --output esn-model.gguf
+
+# 2. Build llama-cli with ESN support.
+cmake -B build
+cmake --build build --target llama-cli -j
+
+# 3. Run inference against the trained model.
+build/bin/llama-cli -m esn-model.gguf -p "Hello" -n 32
+```
+
+Notes:
+- The GGUF produced by `scripts/esn_training.py` carries all ESN hyperparameters
+  (reservoir size, spectral radius, sparsity, leaking rate, activation type,
+  feedback scaling, optional biases) as metadata; `llm_build_esn` reads them at
+  load time.
+- Inference-time features consumed by the C++ graph: activation choice,
+  feedback (when `esn_feedback_scaling > 0` and `esn_feedback_weights` are in
+  the GGUF), input bias, reservoir bias, leaky integration.
+- Training-time-only features: noise injection, bidirectional reservoir
+  initialization, spectral radius scaling, sparsity masking.
+
 ## Testing
 
 Run ESN-specific tests:
