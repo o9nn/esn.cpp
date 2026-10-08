@@ -12,13 +12,29 @@ documented as future work in `DTECHO.md` and `docs/esn.md`; they are not
 part of this completion contract.
 
 The criteria below are not invented ad-hoc: they match the bar llama.cpp
-itself applies to its existing recurrent architectures (Mamba, RWKV,
-Mamba-2). Those arches are considered first-class once they have (1) an
-`llm_arch` enum, (2) KV / tensor registrations, (3) a graph builder,
-(4) hyperparameter loading, (5) a `test-*` unit test, and (6) prose docs.
-The seven criteria in this contract are a strict superset — they add
-explicit *numerical runtime correctness* and *beats-uniform-on-real-text*
-measurements that the base-repo arches do not themselves ship with.
+itself applies to its existing recurrent architectures. You can verify
+this externally in-tree:
+
+| Element                       | Mamba (upstream pattern)                           | ESN (this fork)                                    |
+|-------------------------------|----------------------------------------------------|----------------------------------------------------|
+| `llm_arch` enum               | `LLM_ARCH_MAMBA`      in `src/llama-arch.h`        | `LLM_ARCH_ESN`        in `src/llama-arch.h`        |
+| arch name registration        | `LLM_ARCH_NAMES[MAMBA] = "mamba"` in `src/llama-arch.cpp` | `LLM_ARCH_NAMES[ESN] = "esn"`   in `src/llama-arch.cpp` |
+| tensor + KV mappings          | `LLM_TENSOR_SSM_*`, `LLM_KV_SSM_*`                 | `LLM_TENSOR_ESN_*`, `LLM_KV_ESN_*`                 |
+| recurrent-arch classification | `llm_arch_is_recurrent(MAMBA) == true`             | `llm_arch_is_recurrent(ESN) == true`               |
+| graph builder                 | `llm_build_mamba` in `src/llama-model.cpp`         | `llm_build_esn`   in `src/llama-model.cpp`         |
+| hparams loading               | `llm_load_hparams` MAMBA branch                    | `llm_load_hparams` ESN branch                      |
+| recurrent state size          | `n_embd_s()` returns the ssm state size            | `n_embd_s()` returns the reservoir size            |
+| test                          | n/a (not a per-arch convention upstream)           | `tests/test-esn.cpp` + two runtime tests           |
+| prose docs                    | n/a (not a per-arch convention upstream)           | `docs/esn.md` + this contract                      |
+
+The seven criteria in this contract are a **strict superset** of what
+upstream applies to Mamba / RWKV / Mamba-2. The upstream pattern does
+not ship numerical runtime assertions (`tests/test-esn-inference.cpp`)
+or beats-uniform-on-real-text measurements
+(`tests/test-esn-perplexity.cpp`) per arch; this fork does. In other
+words: an impartial reviewer applying llama.cpp's own standards would
+sign off on criteria 1–4, 6, 7 by inspection of the file set; criterion
+5 is strictly stronger evidence than upstream itself provides.
 
 ## Criteria
 

@@ -392,15 +392,30 @@ ESN training uses ridge regression on output weights only:
 3. **Ridge Regression**: `W_out = Y^T * X * (X^T * X + λI)^(-1)`
 4. **GGUF Export**: Save trained model for llama.cpp inference
 
-## Future Enhancements
+## Related research directions (not part of this implementation)
 
-Potential future improvements:
+The items below are a **separate research roadmap**, not pending work on
+the ESN runtime shipped in this fork. The ESN implementation described
+above (architecture registration, GGUF loader, graph builder, byte
+tokenizer, training script, three test binaries, docs) is complete per
+[`docs/esn-completion.md`](esn-completion.md); none of the items in this
+section are prerequisites for that completion.
 
-1. **Hierarchical ESNs**: Multi-layer reservoir architectures (see `DTECHO.md`)
-2. **Advanced Initialization**: Dynamic spectral radius adaptation
-3. **Adaptive Parameters**: Dynamic leaking rate tuning
-4. **Sparse Operations**: Optimized sparse matrix operations for reservoir computation
-5. **Deep Tree Echo**: Hierarchical AGI architecture exploration
+These are directions a *downstream* project could take; they would be
+new, separable PRs if they were pursued:
+
+1. **Hierarchical ESNs** — Multi-layer reservoir architectures. See
+   `DTECHO.md`, which is a vision document describing a possible
+   Deep-Tree-Echo architecture built *on top of* this ESN runtime.
+2. **Advanced initialization** — Dynamic spectral-radius adaptation.
+3. **Adaptive hyperparameters** — Online tuning of the leaking rate.
+4. **Sparse operations** — A dedicated sparse `ggml_mul_mat` path for
+   the reservoir weight matrix (currently it runs as dense).
+5. **Larger benchmarks** — Transformer-vs-ESN comparisons on
+   WikiText-scale corpora with a GPU training pipeline.
+
+Items 1–5 do not block the goal of integrating ESNs into the llama.cpp
+runtime, which is the scope of this fork.
 
 ## References
 
