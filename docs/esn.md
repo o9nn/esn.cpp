@@ -16,18 +16,27 @@ The key insight of ESNs is that only the output weights need to be trained, whil
 
 ### Core ESN Equation
 
-The ESN dynamics are governed by:
+The full ESN dynamics implemented by `llm_build_esn` are:
 
 ```
-x(t+1) = (1-α) * x(t) + α * tanh(W_res * x(t) + W_in * u(t))
+x(t+1) = (1-α) * x(t) + α * f(W_res * x(t) + W_in * u(t) + W_fb * y(t-1) + b)
+y(t)   = W_out * x(t)
 ```
 
 Where:
 - `x(t)` is the reservoir state at time t
-- `u(t)` is the input at time t  
+- `u(t)` is the input embedding at time t
+- `y(t)` is the output projection at time t
 - `W_res` is the reservoir weight matrix (with spectral radius < 1)
 - `W_in` is the input weight matrix
+- `W_fb` is the optional output-to-reservoir feedback matrix
+- `W_out` is the trained output readout matrix
+- `b` are the optional input/reservoir bias vectors
+- `f` is the activation function (tanh, sigmoid, or leaky-relu)
 - `α` is the leaking rate (controls memory vs. adaptation trade-off)
+
+The feedback term `W_fb * y(t-1)` is only included when `esn_feedback_scaling > 0`
+and the `esn_feedback_weights` tensor is present in the GGUF file.
 
 ### Model Components
 
@@ -69,13 +78,36 @@ ESNs are implemented as a recurrent architecture in llama.cpp, leveraging the ex
 
 ### Forward Pass Implementation
 
-The ESN forward pass consists of:
+The ESN forward pass (`llm_build_esn` in `src/llama-model.cpp`) consists of:
 
-1. **Input Projection**: `W_in * input_embeddings`
-2. **State Retrieval**: Get previous reservoir state from recurrent memory
-3. **Reservoir Update**: Apply ESN dynamics with leaky integration
-4. **State Storage**: Store new reservoir state for next timestep
-5. **Output Projection**: `W_out * reservoir_state → vocabulary_logits`
+1. **Input Projection**: `W_in * input_embeddings`, scaled by `esn_input_scaling`,
+   plus optional `esn_input_bias`
+2. **State Retrieval**: Get previous reservoir state via
+   `llama_memory_recurrent_context::get_s_l(0)` and `build_rs()`
+3. **Recurrent Projection**: `W_res * x(t)`
+4. **Optional Feedback**: When `esn_feedback_scaling > 0` and
+   `esn_feedback_weights` is loaded, add
+   `esn_feedback_scaling * W_fb * (W_out * x(t))` to the pre-activation
+5. **Optional Reservoir Bias**: Add `esn_reservoir_bias`
+6. **Activation**: Apply the selected activation (`esn_activation_type`:
+   tanh, sigmoid, or gelu as a leaky-relu proxy)
+7. **Leaky Integration**: `x(t+1) = (1-α)*x(t) + α*f(...)`
+8. **State Storage**: `ggml_cpy` new state back to `esn_states_all` at
+   `kv_head * reservoir_size`
+9. **Output Normalization & Projection**: RMS norm, then
+   `W_out * reservoir_state → vocabulary_logits`
+
+Notes on features that live outside the inference path:
+
+- **`esn_noise_level`**: injected into the reservoir update during Python
+  training (`scripts/esn_training.py`) for regularization; omitted from the
+  deterministic inference graph
+- **`esn_bidirectional`**: affects how `W_res` is initialized at training
+  time; inference remains strictly causal/forward to preserve streaming
+  semantics
+- **`esn_spectral_radius`, `esn_sparsity`**: baked into the reservoir
+  weight matrix at training time; the inference graph does not need to see
+  them beyond metadata
 
 ### Memory Management
 

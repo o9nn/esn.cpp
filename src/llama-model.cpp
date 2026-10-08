@@ -19348,6 +19348,24 @@ struct llm_build_apertus : public llm_graph_context {
     }
 };
 
+// Echo State Network graph builder.
+//
+// Implements the ESN forward pass:
+//   x(t+1) = (1-α)*x(t) + α*f(W_res*x(t) + W_in*u(t) + W_fb*y(t-1) + b)
+//
+// Features:
+//   - Configurable activation (tanh / sigmoid / gelu as leaky-relu proxy)
+//   - Optional output-to-reservoir feedback (feedback_scaling > 0, W_fb present)
+//   - Optional input and reservoir bias tensors
+//   - Leaky integration via leaking_rate
+//
+// Features set at training time (via scripts/esn_training.py), not needed in
+// the inference path:
+//   - esn_noise_level: noise injection during training for regularization
+//   - esn_bidirectional: reservoir weights initialized for bidirectional
+//     processing; inference remains causal/forward-only to preserve
+//     streaming semantics
+//   - esn_spectral_radius / esn_sparsity: baked into W_res at training time
 struct llm_build_esn : public llm_graph_context_mamba {
     // Helper function to apply activation based on type
     ggml_tensor * apply_esn_activation(ggml_tensor * x, uint32_t activation_type) {
@@ -19420,6 +19438,20 @@ struct llm_build_esn : public llm_graph_context_mamba {
 
         // Add input projection: W_res*x(t) + W_in*u(t)
         ggml_tensor * reservoir_input = ggml_add(ctx0, reservoir_recurrent, input_sum);
+
+        // Add output-to-reservoir feedback if enabled: + W_fb * y(t-1)
+        // We approximate y(t-1) by projecting the previous reservoir state through W_out,
+        // then project back through W_fb. This provides the characteristic ESN feedback
+        // dynamic without requiring a separate output state cache.
+        if (model.layers[0].wv && feedback_scaling > 0.0f) {
+            // y_prev = W_out * x(t): {n_vocab, reservoir_size} * {reservoir_size, n_seqs} -> {n_vocab, n_seqs}
+            ggml_tensor * y_prev = ggml_mul_mat(ctx0, model.output, reservoir_state);
+            // W_fb * y_prev: {reservoir_size, n_vocab} * {n_vocab, n_seqs} -> {reservoir_size, n_seqs}
+            ggml_tensor * feedback = ggml_mul_mat(ctx0, model.layers[0].wv, y_prev);
+            feedback = ggml_scale(ctx0, feedback, feedback_scaling);
+            reservoir_input = ggml_add(ctx0, reservoir_input, feedback);
+            cb(feedback, "esn_feedback", -1);
+        }
 
         // Add reservoir bias if present
         if (model.layers[0].bk) {
