@@ -644,6 +644,59 @@ def create_sample_training_data(
     return input_seqs, target_seqs
 
 
+def load_text_training_data(
+    path: str,
+    vocab_size: int,
+    seq_length: int = 128,
+    stride: Optional[int] = None,
+    max_sequences: Optional[int] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Load a text file and turn it into training sequences for the
+    byte-level ESN. The whole file is read as UTF-8 bytes, split into
+    overlapping windows of length ``seq_length + 1``, and returned as
+    (input, target) pairs where target[i] = input[i+1] (next-byte
+    prediction).
+
+    Only valid when ``vocab_size == 256`` (byte-level); the caller is
+    responsible for matching that to the model's vocab size.
+    """
+    if vocab_size != 256:
+        raise ValueError(
+            f"load_text_training_data requires vocab_size=256, got {vocab_size}"
+        )
+
+    with open(path, "rb") as f:
+        data = f.read()
+    if len(data) < seq_length + 1:
+        raise ValueError(
+            f"Training file too short ({len(data)} bytes); need at least "
+            f"{seq_length + 1}"
+        )
+
+    tokens = np.frombuffer(data, dtype=np.uint8).astype(np.int32)
+    if stride is None:
+        stride = max(1, seq_length // 2)
+
+    inputs = []
+    targets = []
+    for start in range(0, len(tokens) - seq_length, stride):
+        window = tokens[start : start + seq_length + 1]
+        inputs.append(window[:-1])
+        targets.append(window[1:])
+        if max_sequences is not None and len(inputs) >= max_sequences:
+            break
+
+    inputs_arr  = np.stack(inputs,  axis=0)
+    targets_arr = np.stack(targets, axis=0)
+
+    print(
+        f"Loaded {len(inputs_arr)} windows of length {seq_length} from "
+        f"{path} ({len(data)} bytes)"
+    )
+    return inputs_arr, targets_arr
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="ESN Training and Model Creation",
@@ -761,9 +814,11 @@ Examples:
         # Load or create training data
         if args.train_data:
             print(f"Loading training data from {args.train_data}")
-            # TODO: Implement actual data loading
-            input_seqs, target_seqs = create_sample_training_data(
-                config.vocab_size, args.n_sequences, args.seq_length, config.seed
+            input_seqs, target_seqs = load_text_training_data(
+                args.train_data,
+                config.vocab_size,
+                seq_length=args.seq_length,
+                max_sequences=args.n_sequences,
             )
         else:
             print("Using sample training data (for testing only)")
