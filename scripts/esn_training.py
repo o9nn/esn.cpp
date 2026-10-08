@@ -74,7 +74,8 @@ class ESNConfig:
         use_bias: bool = False,
         context_length: int = 2048,
         regularization: float = 1e-6,
-        seed: int = 42
+        seed: int = 42,
+        tokenizer: str = "byte",
     ):
         self.vocab_size = vocab_size
         self.embedding_dim = embedding_dim
@@ -91,6 +92,13 @@ class ESNConfig:
         self.context_length = context_length
         self.regularization = regularization
         self.seed = seed
+        self.tokenizer = tokenizer  # "byte" | "none"
+        if self.tokenizer == "byte" and self.vocab_size != 256:
+            # Byte tokenizer must have vocab == 256. Auto-correct and warn
+            # rather than silently producing a broken model.
+            print(f"[ESNConfig] tokenizer='byte' requires vocab_size=256; "
+                  f"overriding vocab_size {self.vocab_size} -> 256")
+            self.vocab_size = 256
 
     @classmethod
     def from_json(cls, path: str) -> "ESNConfig":
@@ -492,12 +500,19 @@ class ESN:
         writer.add_block_count(1)
         writer.add_layer_norm_rms_eps(1e-6)
 
-        # Minimal tokenizer stub. ESN models are byte-level or token-id driven
-        # in practice; this stub tells llama.cpp "no vocab" (LLAMA_VOCAB_TYPE_NONE)
-        # and llama.cpp fills in dummy token entries from vocab_size. For real
-        # text generation, replace with a proper tokenizer (SPM/BPE) by writing
-        # tokens, scores, token_type and the matching tokenizer_model.
-        writer.add_tokenizer_model("no_vocab")
+        # Tokenizer. Two paths are supported:
+        #
+        #   - "byte" (default): a 256-token byte-level tokenizer written in
+        #     the RWKV escape format (\xNN per byte). Produces a working
+        #     text-prompt path: any input string is split into its UTF-8
+        #     bytes, each mapped to its byte-id. Requires vocab_size == 256.
+        #
+        #   - "none": emits the "no_vocab" stub. The model loads but text
+        #     tokenization is unavailable; drive it with raw token IDs via
+        #     llama_batch_get_one. Useful when the ESN is being used as a
+        #     non-text sequence learner.
+        #
+        self._write_tokenizer(writer)
 
         # ESN-specific hyperparameters (match LLM_KV_ESN_* in llama-arch.cpp)
         writer.add_uint32("esn.reservoir_size",    self.config.reservoir_size)
@@ -553,6 +568,58 @@ class ESN:
         writer.close()
 
         print(f"Model saved successfully ({os.path.getsize(path) / 1e6:.1f} MB)")
+
+    def _write_tokenizer(self, writer: GGUFWriter) -> None:
+        """Write the tokenizer section to the GGUF file.
+
+        Two modes:
+          - "byte": a 256-token byte-level tokenizer using the RWKV escape
+            format. Any text input is split into UTF-8 bytes and each byte
+            becomes its own token. llama-cli -p "..." works.
+          - "none": the "no_vocab" stub. Load-only, raw-token-id driven.
+        """
+        mode = self.config.tokenizer
+
+        if mode == "none":
+            writer.add_tokenizer_model("no_vocab")
+            return
+
+        if mode != "byte":
+            raise ValueError(f"Unknown tokenizer mode: {mode!r} (expected 'byte' or 'none')")
+
+        # Byte-level RWKV-escape tokenizer:
+        # - 256 tokens, one per byte value 0..255
+        # - Token text uses the RWKV escape format llama.cpp expects
+        #   (see llama_unescape_rwkv_token in src/llama-vocab.cpp):
+        #     \xNN for arbitrary bytes
+        #     \t \n \r for the standard whitespace escapes (kept readable)
+        #     printable ASCII bytes written literally
+        tokens = []
+        for b in range(256):
+            if b == 0x09:
+                tokens.append("\\t")
+            elif b == 0x0A:
+                tokens.append("\\n")
+            elif b == 0x0D:
+                tokens.append("\\r")
+            elif b == 0x5C:  # backslash itself must be escaped
+                tokens.append("\\\\")
+            elif 0x20 <= b < 0x7F:
+                tokens.append(chr(b))
+            else:
+                tokens.append(f"\\x{b:02x}")
+
+        # All byte tokens are "normal" (type 1). No merges, scores, or
+        # special-token IDs are needed for the RWKV tokenizer type —
+        # the vocab is just a flat lookup from byte to id.
+        token_types = [1] * 256
+
+        writer.add_tokenizer_model("rwkv")
+        writer.add_token_list(tokens)
+        writer.add_token_types(token_types)
+        # No BOS/EOS by default — users can set these via CLI if needed.
+        writer.add_add_bos_token(False)
+        writer.add_add_eos_token(False)
 
 
 def create_sample_training_data(
@@ -634,6 +701,13 @@ Examples:
     parser.add_argument("--seq-length", type=int, default=128)
     parser.add_argument("--washout", type=int, default=100)
 
+    # Tokenizer
+    parser.add_argument("--tokenizer", choices=["byte", "none"], default="byte",
+                        help="Tokenizer type. 'byte' (default) emits a 256-"
+                             "token byte-level tokenizer so llama-cli -p "
+                             "\"text\" works. 'none' emits the no_vocab stub "
+                             "for raw-token-id driven use.")
+
     # Modes
     parser.add_argument("--init-only", action="store_true",
                         help="Only initialize weights, don't train")
@@ -668,7 +742,8 @@ Examples:
             use_bias=args.use_bias,
             context_length=args.context_length,
             regularization=args.regularization,
-            seed=args.seed
+            seed=args.seed,
+            tokenizer=args.tokenizer,
         )
 
     # Save config if requested

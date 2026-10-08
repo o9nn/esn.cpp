@@ -1362,7 +1362,18 @@ void llama_context::output_reorder() {
 //
 
 uint32_t llama_context::graph_max_nodes() const {
-    return std::max<uint32_t>(1024u, 8u*model.n_tensors());
+    uint32_t base = std::max<uint32_t>(1024u, 8u*model.n_tensors());
+
+    // ESN unrolls the recurrence per token inside llm_build_esn, which
+    // produces ~10-15 ggml nodes per timestep. The default node budget is
+    // sized for layer-wise architectures (nodes ∝ n_layer), so for ESN we
+    // scale it with the ubatch size instead.
+    if (model.arch == LLM_ARCH_ESN) {
+        const uint32_t per_token_nodes = 32; // generous headroom for feedback + bias
+        base = std::max(base, per_token_nodes * cparams.n_batch);
+    }
+
+    return base;
 }
 
 llm_graph_result * llama_context::get_gf_res_reserve() const {

@@ -288,30 +288,27 @@ build/bin/test-esn-inference esn-model.gguf
 
 ### Tokenizer
 
-By design, `scripts/esn_training.py` writes `tokenizer.ggml.model = "no_vocab"`.
-That tells llama.cpp to allocate the full vocab as dummy entries, which keeps
-the model loadable and lets you drive inference via raw token IDs
-(`llama_batch_get_one` with `llama_token` values, as in
-`tests/test-esn-inference.cpp`). It does **not** support text-prompt
-tokenization — `llama-cli -p "..."` will abort with
-`Tokenizer not initialized` on a no-vocab model.
+`scripts/esn_training.py` writes a 256-token byte-level tokenizer by
+default (the `--tokenizer byte` mode), using the RWKV-style escape format
+llama.cpp supports. Any input string is split into its UTF-8 bytes and
+each byte becomes its own token, which gives:
 
-To do text-prompt inference, replace the stub with a real tokenizer. The
-simplest route is to copy the tokenizer section from an existing GGUF whose
-vocabulary size matches `esn.vocab_size`:
+- `llama-cli -p "..."` works directly, no extra setup
+- `vocab_size` is pinned to 256 (the script will override larger values
+  with a warning so training/inference stay consistent)
+- Round-trip is exact — a model that memorizes a byte-sequence produces
+  that sequence back verbatim
 
-```bash
-# Example: paste the tokenizer from llama-2.gguf into your ESN GGUF
-#   gguf-py/scripts/gguf_set_metadata.py has helpers for this
-python gguf-py/gguf/scripts/gguf_dump.py source-model.gguf \
-    | grep tokenizer
-```
+For non-text sequence-learning use cases (where the ESN is driven with
+raw token IDs via `llama_batch_get_one`, as in
+`tests/test-esn-inference.cpp`), pass `--tokenizer none` to emit the
+`no_vocab` stub instead. The model loads but `llama-cli -p "..."` will
+not work on it.
 
-Then either (a) rewrite `scripts/esn_training.py` to call
-`writer.add_tokenizer_model(...)`, `writer.add_token_list(...)`,
-`writer.add_token_scores(...)`, and `writer.add_token_types(...)` with the
-tokenizer data, or (b) merge the tokenizer tensors in with
-`gguf_new_metadata.py`.
+Switching to a larger pretrained tokenizer (SPM/BPE) is a straightforward
+extension of `_write_tokenizer()` — call `writer.add_tokenizer_model(...)`,
+`writer.add_token_list(...)`, `writer.add_token_scores(...)`, and
+`writer.add_token_types(...)` with the data from any compatible GGUF.
 
 ### Hyperparameter split: inference-time vs training-time
 
