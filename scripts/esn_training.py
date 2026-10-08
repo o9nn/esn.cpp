@@ -30,17 +30,24 @@ import json
 import numpy as np
 from pathlib import Path
 from typing import Optional, Tuple, Dict, Any, Callable
-import struct
 import os
+import sys
 
-# GGUF format constants
-GGUF_MAGIC = 0x46554747  # "GGUF"
-GGUF_VERSION = 3
+# Prefer the in-tree gguf package (gguf-py/) so this script matches the
+# llama.cpp build exactly, even in an environment where the published
+# `gguf` wheel is older than this fork.
+_HERE = Path(__file__).resolve().parent
+_GGUF_PY = _HERE.parent / "gguf-py"
+if _GGUF_PY.is_dir():
+    sys.path.insert(0, str(_GGUF_PY))
 
-# GGML types
-GGML_TYPE_F32 = 0
-GGML_TYPE_F16 = 1
-GGML_TYPE_Q8_0 = 8
+try:
+    from gguf import GGUFWriter, GGMLQuantizationType
+except ImportError as e:
+    raise SystemExit(
+        "The 'gguf' package is required. Install the one bundled with this\n"
+        "repository by running: pip install -e gguf-py"
+    ) from e
 
 # Activation type constants (must match llama-hparams.h)
 ACTIVATION_TANH = 0
@@ -434,146 +441,112 @@ class ESN:
 
     def save_gguf(self, path: str) -> None:
         """
-        Save the trained ESN model to GGUF format.
+        Save the ESN model as a GGUF file compatible with esn.cpp's
+        ``llm_build_esn`` graph builder.
 
-        Args:
-            path: Output path for the GGUF file
+        Metadata keys use the ``esn.*`` namespace matching the KV mappings
+        declared in ``src/llama-arch.cpp``:
+
+          - ``esn.reservoir_size``   (uint32, required)
+          - ``esn.spectral_radius``  (float32, required)
+          - ``esn.sparsity``         (float32, required)
+          - ``esn.leaking_rate``     (float32, required)
+          - ``esn.input_scaling``    (float32, required)
+          - ``esn.feedback_scaling`` (float32, optional)
+          - ``esn.noise_level``      (float32, optional)
+          - ``esn.activation_type``  (uint32, optional: 0=tanh, 1=sigmoid, 2=leaky_relu)
+          - ``esn.bidirectional``    (bool, optional)
+          - ``esn.attention.layernorm_rms_eps`` (float32, required by loader)
+
+        Tensors emitted (``.weight`` suffix per llama.cpp convention):
+          - ``token_embd.weight``          [n_embd, n_vocab]
+          - ``esn_input_weights.weight``   [n_embd, reservoir_size]
+          - ``esn_reservoir_weights.weight`` [reservoir_size, reservoir_size]
+          - ``output_norm.weight``         [reservoir_size]
+          - ``esn_output_weights.weight``  [reservoir_size, n_vocab]
+          - ``esn_feedback_weights.weight``  (optional)
+          - ``esn_input_bias.weight``        (optional)
+          - ``esn_reservoir_bias.weight``    (optional)
         """
         if not self._initialized:
             raise RuntimeError("ESN not initialized. Call initialize() first.")
 
         print(f"Saving model to {path}")
 
-        with open(path, 'wb') as f:
-            # Write GGUF header
-            self._write_gguf_header(f)
+        writer = GGUFWriter(path=path, arch="esn")
 
-            # Write tensors
-            self._write_tensors(f)
+        # General metadata
+        writer.add_name("ESN Model")
+
+        # Base model dimensions — use the standard key helpers so llama.cpp's
+        # auto-derived KV keys resolve correctly (they map arch -> key).
+        writer.add_vocab_size(self.config.vocab_size)
+        writer.add_embedding_length(self.config.embedding_dim)
+        writer.add_context_length(self.config.context_length)
+        writer.add_block_count(1)
+        writer.add_layer_norm_rms_eps(1e-6)
+
+        # Minimal tokenizer stub. ESN models are byte-level or token-id driven
+        # in practice; this stub tells llama.cpp "no vocab" (LLAMA_VOCAB_TYPE_NONE)
+        # and llama.cpp fills in dummy token entries from vocab_size. For real
+        # text generation, replace with a proper tokenizer (SPM/BPE) by writing
+        # tokens, scores, token_type and the matching tokenizer_model.
+        writer.add_tokenizer_model("no_vocab")
+
+        # ESN-specific hyperparameters (match LLM_KV_ESN_* in llama-arch.cpp)
+        writer.add_uint32("esn.reservoir_size",    self.config.reservoir_size)
+        writer.add_float32("esn.spectral_radius",  self.config.spectral_radius)
+        writer.add_float32("esn.sparsity",         self.config.sparsity)
+        writer.add_float32("esn.leaking_rate",     self.config.leaking_rate)
+        writer.add_float32("esn.input_scaling",    self.config.input_scaling)
+        writer.add_float32("esn.feedback_scaling", self.config.feedback_scaling)
+        writer.add_float32("esn.noise_level",      self.config.noise_level)
+        writer.add_uint32("esn.activation_type",   self.config.activation_type)
+        writer.add_bool("esn.bidirectional",       self.config.bidirectional)
+
+        # Tensors (always .weight-suffixed to match tn(..., "weight") in C++).
+        #
+        # The gguf writer reverses the numpy shape when it emits tensor info
+        # (GGUF ne[0] is fastest-varying). The C++ loader creates these with
+        # {ne[0], ne[1]} directly, so numpy shape (a, b) ends up as GGUF
+        # [b, a]. The required Python shapes are therefore the REVERSE of
+        # the C++ create_tensor shapes:
+        #
+        #   token_embd.weight            C++ {n_embd, n_vocab}
+        #       -> numpy (n_vocab, n_embd)        [we train (n_embd, n_vocab), so transpose]
+        #   esn_input_weights.weight     C++ {n_embd, reservoir}
+        #       -> numpy (reservoir, n_embd)      [matches training layout]
+        #   esn_reservoir_weights.weight C++ {reservoir, reservoir}
+        #       -> numpy (reservoir, reservoir)   [square]
+        #   output_norm.weight           C++ {reservoir}                  [1-D]
+        #   esn_output_weights.weight    C++ {reservoir, n_vocab}
+        #       -> numpy (n_vocab, reservoir)     [matches training layout]
+        #   esn_feedback_weights.weight  C++ {n_vocab, reservoir}
+        #       -> numpy (reservoir, n_vocab)     [matches training layout]
+        #   esn_input_bias.weight        C++ {reservoir}                  [1-D]
+        #   esn_reservoir_bias.weight    C++ {reservoir}                  [1-D]
+        def _f32(x: np.ndarray) -> np.ndarray:
+            return np.ascontiguousarray(x, dtype=np.float32)
+
+        writer.add_tensor("token_embd.weight",            _f32(self.tok_embd.T))
+        writer.add_tensor("esn_input_weights.weight",     _f32(self.W_in))
+        writer.add_tensor("esn_reservoir_weights.weight", _f32(self.W_res))
+        writer.add_tensor("output_norm.weight",           _f32(self.output_norm))
+        writer.add_tensor("esn_output_weights.weight",    _f32(self.W_out))
+
+        if self.W_fb is not None:
+            writer.add_tensor("esn_feedback_weights.weight", _f32(self.W_fb))
+        if self.b_in is not None:
+            writer.add_tensor("esn_input_bias.weight",       _f32(self.b_in))
+        if self.b_res is not None:
+            writer.add_tensor("esn_reservoir_bias.weight",   _f32(self.b_res))
+
+        writer.write_header_to_file()
+        writer.write_kv_data_to_file()
+        writer.write_tensors_to_file()
+        writer.close()
 
         print(f"Model saved successfully ({os.path.getsize(path) / 1e6:.1f} MB)")
-
-    def _write_gguf_header(self, f) -> None:
-        """Write GGUF file header with metadata."""
-        # Magic and version
-        f.write(struct.pack('<I', GGUF_MAGIC))
-        f.write(struct.pack('<I', GGUF_VERSION))
-
-        # Count tensors
-        n_tensors = 5  # tok_embd, W_in, W_res, output_norm, W_out
-        if self.W_fb is not None:
-            n_tensors += 1
-        if self.b_in is not None:
-            n_tensors += 1
-        if self.b_res is not None:
-            n_tensors += 1
-
-        # Count KV pairs
-        n_kv = 16  # Base metadata + extended ESN params
-
-        f.write(struct.pack('<Q', n_tensors))
-        f.write(struct.pack('<Q', n_kv))
-
-        # Write metadata
-        self._write_string_kv(f, "general.architecture", "esn")
-        self._write_string_kv(f, "general.name", "ESN Model")
-
-        self._write_uint32_kv(f, "esn.vocab_size", self.config.vocab_size)
-        self._write_uint32_kv(f, "esn.embedding_length", self.config.embedding_dim)
-        self._write_uint32_kv(f, "esn.context_length", self.config.context_length)
-        self._write_uint32_kv(f, "esn.reservoir_size", self.config.reservoir_size)
-        self._write_uint32_kv(f, "esn.block_count", 1)
-
-        self._write_float32_kv(f, "esn.spectral_radius", self.config.spectral_radius)
-        self._write_float32_kv(f, "esn.sparsity", self.config.sparsity)
-        self._write_float32_kv(f, "esn.leaking_rate", self.config.leaking_rate)
-        self._write_float32_kv(f, "esn.input_scaling", self.config.input_scaling)
-        self._write_float32_kv(f, "esn.feedback_scaling", self.config.feedback_scaling)
-        self._write_float32_kv(f, "esn.noise_level", self.config.noise_level)
-        self._write_uint32_kv(f, "esn.activation_type", self.config.activation_type)
-        self._write_bool_kv(f, "esn.bidirectional", self.config.bidirectional)
-        self._write_float32_kv(f, "esn.attention.layernorm_rms_eps", 1e-6)
-
-    def _write_tensors(self, f) -> None:
-        """Write tensor data to GGUF file."""
-        tensors = [
-            ("token_embd.weight", self.tok_embd),
-            ("esn_input_weights.weight", self.W_in),
-            ("esn_reservoir_weights.weight", self.W_res),
-            ("output_norm.weight", self.output_norm),
-            ("esn_output_weights.weight", self.W_out),
-        ]
-
-        # Add optional tensors
-        if self.W_fb is not None:
-            tensors.append(("esn_feedback_weights.weight", self.W_fb))
-        if self.b_in is not None:
-            tensors.append(("esn_input_bias.weight", self.b_in))
-        if self.b_res is not None:
-            tensors.append(("esn_reservoir_bias.weight", self.b_res))
-
-        # Calculate tensor info offset
-        offset = f.tell()
-
-        # Write tensor metadata
-        for name, tensor in tensors:
-            self._write_tensor_info(f, name, tensor.shape, GGML_TYPE_F32, offset)
-            offset += tensor.nbytes
-
-        # Align to 32 bytes
-        alignment = 32
-        current_pos = f.tell()
-        padding = (alignment - (current_pos % alignment)) % alignment
-        f.write(b'\x00' * padding)
-
-        # Write tensor data
-        for name, tensor in tensors:
-            f.write(tensor.astype(np.float32).tobytes())
-
-    def _write_string_kv(self, f, key: str, value: str) -> None:
-        """Write string key-value pair."""
-        key_bytes = key.encode('utf-8')
-        f.write(struct.pack('<Q', len(key_bytes)))
-        f.write(key_bytes)
-        f.write(struct.pack('<I', 8))  # Type = string
-        value_bytes = value.encode('utf-8')
-        f.write(struct.pack('<Q', len(value_bytes)))
-        f.write(value_bytes)
-
-    def _write_uint32_kv(self, f, key: str, value: int) -> None:
-        """Write uint32 key-value pair."""
-        key_bytes = key.encode('utf-8')
-        f.write(struct.pack('<Q', len(key_bytes)))
-        f.write(key_bytes)
-        f.write(struct.pack('<I', 4))  # Type = uint32
-        f.write(struct.pack('<I', value))
-
-    def _write_float32_kv(self, f, key: str, value: float) -> None:
-        """Write float32 key-value pair."""
-        key_bytes = key.encode('utf-8')
-        f.write(struct.pack('<Q', len(key_bytes)))
-        f.write(key_bytes)
-        f.write(struct.pack('<I', 6))  # Type = float32
-        f.write(struct.pack('<f', value))
-
-    def _write_bool_kv(self, f, key: str, value: bool) -> None:
-        """Write bool key-value pair."""
-        key_bytes = key.encode('utf-8')
-        f.write(struct.pack('<Q', len(key_bytes)))
-        f.write(key_bytes)
-        f.write(struct.pack('<I', 7))  # Type = bool
-        f.write(struct.pack('<?', value))
-
-    def _write_tensor_info(self, f, name: str, shape: tuple, dtype: int, offset: int) -> None:
-        """Write tensor info to GGUF."""
-        name_bytes = name.encode('utf-8')
-        f.write(struct.pack('<Q', len(name_bytes)))
-        f.write(name_bytes)
-        f.write(struct.pack('<I', len(shape)))
-        for dim in shape:
-            f.write(struct.pack('<Q', dim))
-        f.write(struct.pack('<I', dtype))
-        f.write(struct.pack('<Q', offset))
 
 
 def create_sample_training_data(

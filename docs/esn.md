@@ -302,17 +302,30 @@ Notes:
 Run ESN-specific tests:
 
 ```bash
-# Build and run ESN tests
+# Static architecture tests (no model file needed)
 cmake --build build --target test-esn
 ctest --test-dir build -R test-esn --verbose
+
+# End-to-end inference smoke test (loads a real GGUF, runs llama_decode)
+cmake --build build --target test-esn-inference
+python scripts/esn_training.py --init-only --reservoir-size 128 \
+    --vocab-size 1024 --embedding-dim 64 --output /tmp/esn-smoke.gguf
+build/bin/test-esn-inference /tmp/esn-smoke.gguf
 ```
 
-Test coverage includes:
-- Architecture recognition
-- Tensor mapping validation  
-- Hyperparameter initialization
-- Recurrent memory integration
-- Forward pass computation
+Static test coverage (`tests/test-esn.cpp`):
+- Architecture recognition and name mapping
+- Recurrent / hybrid / diffusion classification
+- Tensor info mappings for all 6 ESN tensors (weights + biases + feedback)
+- Hyperparameter defaults (base + extended)
+- Tensor name generation
+- `n_embd_s()` returns `reservoir_size` for ESN models
+
+End-to-end inference coverage (`tests/test-esn-inference.cpp`):
+- GGUF metadata & tensor-shape loading for `arch=esn`
+- `llama_memory_recurrent` allocation sized by `n_embd_s()`
+- `llm_build_esn` forward graph construction and execution
+- `llama_decode` success and finite logits
 
 ## Training ESN Models
 

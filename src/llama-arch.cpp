@@ -2445,13 +2445,20 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
     {LLM_TENSOR_NEXTN_HNORM,                {LLM_TENSOR_LAYER_OUTPUT, GGML_OP_MUL}},
     {LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD,     {LLM_TENSOR_LAYER_OUTPUT, GGML_OP_MUL_MAT}},
     {LLM_TENSOR_NEXTN_SHARED_HEAD_NORM,     {LLM_TENSOR_LAYER_OUTPUT, GGML_OP_MUL}},
-    // ESN specific tensors
-    {LLM_TENSOR_ESN_INPUT_WEIGHTS,          {LLM_TENSOR_LAYER_INPUT, GGML_OP_MUL_MAT}},
-    {LLM_TENSOR_ESN_RESERVOIR_WEIGHTS,      {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    // ESN specific tensors.
+    //
+    // ESN logically has exactly one reservoir "layer" and we address it as
+    // layers[0] in the C++ loader. The create_tensor() calls use tn(...)
+    // without a layer index, so these tensors must be classified as non-
+    // repeating (INPUT / OUTPUT) — otherwise the loader asserts
+    // "repeating layer tensor used without a layer number". Classifying them
+    // as INPUT also keeps the GGUF tensor names stable (no blk.N. prefix).
+    {LLM_TENSOR_ESN_INPUT_WEIGHTS,          {LLM_TENSOR_LAYER_INPUT,  GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_ESN_RESERVOIR_WEIGHTS,      {LLM_TENSOR_LAYER_INPUT,  GGML_OP_MUL_MAT}},
     {LLM_TENSOR_ESN_OUTPUT_WEIGHTS,         {LLM_TENSOR_LAYER_OUTPUT, GGML_OP_MUL_MAT}},
-    {LLM_TENSOR_ESN_FEEDBACK_WEIGHTS,       {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
-    {LLM_TENSOR_ESN_INPUT_BIAS,             {LLM_TENSOR_LAYER_INPUT, GGML_OP_ADD}},
-    {LLM_TENSOR_ESN_RESERVOIR_BIAS,         {LLM_TENSOR_LAYER_REPEATING, GGML_OP_ADD}},
+    {LLM_TENSOR_ESN_FEEDBACK_WEIGHTS,       {LLM_TENSOR_LAYER_INPUT,  GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_ESN_INPUT_BIAS,             {LLM_TENSOR_LAYER_INPUT,  GGML_OP_ADD}},
+    {LLM_TENSOR_ESN_RESERVOIR_BIAS,         {LLM_TENSOR_LAYER_INPUT,  GGML_OP_ADD}},
 };
 
 LLM_KV::LLM_KV(llm_arch arch, const char * suffix) : arch(arch), suffix(suffix) {}

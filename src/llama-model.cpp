@@ -5999,26 +5999,44 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                 {
                     const int64_t reservoir_size = hparams.esn_reservoir_size;
 
-                    // ESN architecture tensors
+                    // ESN architecture tensors.
+                    //
+                    // Shape convention: create_tensor({a, b}) sets ne[0]=a,
+                    // ne[1]=b. ggml_mul_mat(A, B) requires A.ne[0] == B.ne[0]
+                    // (the contracted dimension), and produces
+                    // [A.ne[1], B.ne[1]]. So for every W used as
+                    // ggml_mul_mat(W, x), we size it as {input_dim, output_dim}
+                    // so that W.ne[0] matches x.ne[0] and the result has
+                    // output_dim rows.
+
+                    // {n_embd, n_vocab}: embedding row lookup, ne[0]=n_embd
+                    // keeps per-token embedding vectors contiguous.
                     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
 
-                    // Input weights: projects input embeddings to reservoir
-                    layers.resize(1); // ESN uses a single "layer" to store the weights
-                    layers[0].wq = create_tensor(tn(LLM_TENSOR_ESN_INPUT_WEIGHTS, "weight"), {reservoir_size, n_embd}, 0);
+                    // ESN uses a single "layer" to hold all the weight tensors.
+                    layers.resize(1);
 
-                    // Reservoir weights: recurrent connections within reservoir
+                    // W_in: used as ggml_mul_mat(W_in, embd) where embd.ne[0]=n_embd.
+                    // So W_in.ne[0]=n_embd, W_in.ne[1]=reservoir_size.
+                    layers[0].wq = create_tensor(tn(LLM_TENSOR_ESN_INPUT_WEIGHTS, "weight"), {n_embd, reservoir_size}, 0);
+
+                    // W_res: square recurrent matrix.
                     layers[0].wk = create_tensor(tn(LLM_TENSOR_ESN_RESERVOIR_WEIGHTS, "weight"), {reservoir_size, reservoir_size}, 0);
 
-                    // Output normalization and projection
+                    // RMS norm weights are per-feature along reservoir axis.
                     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {reservoir_size}, 0);
 
-                    // Output weights: projects reservoir states to vocabulary
-                    output = create_tensor(tn(LLM_TENSOR_ESN_OUTPUT_WEIGHTS, "weight"), {n_vocab, reservoir_size}, 0);
+                    // W_out: used as ggml_mul_mat(W_out, reservoir_state).
+                    // reservoir_state.ne[0]=reservoir_size, so W_out.ne[0]=reservoir_size,
+                    // W_out.ne[1]=n_vocab.
+                    output = create_tensor(tn(LLM_TENSOR_ESN_OUTPUT_WEIGHTS, "weight"), {reservoir_size, n_vocab}, 0);
 
-                    // Optional: feedback weights (output-to-reservoir connections)
-                    layers[0].wv = create_tensor(tn(LLM_TENSOR_ESN_FEEDBACK_WEIGHTS, "weight"), {reservoir_size, n_vocab}, TENSOR_NOT_REQUIRED);
+                    // Optional: W_fb used as ggml_mul_mat(W_fb, y_prev) where
+                    // y_prev.ne[0]=n_vocab, so W_fb.ne[0]=n_vocab,
+                    // W_fb.ne[1]=reservoir_size.
+                    layers[0].wv = create_tensor(tn(LLM_TENSOR_ESN_FEEDBACK_WEIGHTS, "weight"), {n_vocab, reservoir_size}, TENSOR_NOT_REQUIRED);
 
-                    // Optional: bias vectors
+                    // Optional: bias vectors (same length as reservoir).
                     layers[0].bq = create_tensor(tn(LLM_TENSOR_ESN_INPUT_BIAS, "weight"), {reservoir_size}, TENSOR_NOT_REQUIRED);
                     layers[0].bk = create_tensor(tn(LLM_TENSOR_ESN_RESERVOIR_BIAS, "weight"), {reservoir_size}, TENSOR_NOT_REQUIRED);
                 } break;

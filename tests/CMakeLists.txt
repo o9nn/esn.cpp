@@ -145,6 +145,10 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-grammar-integration.cpp)
     llama_build_and_test(test-llama-grammar.cpp)
     llama_build_and_test(test-esn.cpp)
+    # test-esn-inference needs a model path argument, so build it without
+    # registering a CTest. Invoke directly:
+    #   bin/test-esn-inference /path/to/esn-model.gguf
+    llama_build(test-esn-inference.cpp)
     llama_build_and_test(test-chat.cpp)
     # TODO: disabled on loongarch64 because the ggml-ci node lacks Python 3.8
     if (NOT ${CMAKE_SYSTEM_PROCESSOR} MATCHES "loongarch64")
