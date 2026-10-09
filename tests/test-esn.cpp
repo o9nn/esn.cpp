@@ -59,22 +59,27 @@ int main() {
         std::cout << "Test 3: ESN tensor info mappings... ";
         const llm_tensor_info & input_info = llm_tensor_info_for(LLM_TENSOR_ESN_INPUT_WEIGHTS);
         assert(input_info.layer == LLM_TENSOR_LAYER_INPUT);
-        assert(input_info.op   == GGML_OP_MUL_MAT);
-
+        assert(input_info.op == GGML_OP_MUL_MAT);
+        
+        // ESN has exactly one reservoir layer and is addressed as layers[0],
+        // so reservoir tensors are classified as non-repeating INPUT (otherwise
+        // the loader asserts "repeating layer tensor used without a layer number").
         const llm_tensor_info & reservoir_info = llm_tensor_info_for(LLM_TENSOR_ESN_RESERVOIR_WEIGHTS);
-        assert(reservoir_info.layer == LLM_TENSOR_LAYER_REPEATING);
-        assert(reservoir_info.op   == GGML_OP_MUL_MAT);
-
+        assert(reservoir_info.layer == LLM_TENSOR_LAYER_INPUT);
+        assert(reservoir_info.op == GGML_OP_MUL_MAT);
         const llm_tensor_info & output_info = llm_tensor_info_for(LLM_TENSOR_ESN_OUTPUT_WEIGHTS);
         assert(output_info.layer == LLM_TENSOR_LAYER_OUTPUT);
         assert(output_info.op   == GGML_OP_MUL_MAT);
 
         // Optional tensor infos
         const llm_tensor_info & fb_info  = llm_tensor_info_for(LLM_TENSOR_ESN_FEEDBACK_WEIGHTS);
+        assert(fb_info.layer == LLM_TENSOR_LAYER_INPUT);
         assert(fb_info.op == GGML_OP_MUL_MAT);
         const llm_tensor_info & ib_info  = llm_tensor_info_for(LLM_TENSOR_ESN_INPUT_BIAS);
+        assert(ib_info.layer == LLM_TENSOR_LAYER_INPUT);
         assert(ib_info.op == GGML_OP_ADD);
         const llm_tensor_info & rb_info  = llm_tensor_info_for(LLM_TENSOR_ESN_RESERVOIR_BIAS);
+        assert(rb_info.layer == LLM_TENSOR_LAYER_INPUT);
         assert(rb_info.op == GGML_OP_ADD);
         std::cout << "PASSED\n";
     }
@@ -84,16 +89,20 @@ int main() {
     // ------------------------------------------------------------------ //
     {
         std::cout << "Test 4: ESN hyperparameter defaults... ";
-        llama_hparams h;
-        assert(h.esn_reservoir_size   == 0);
-        assert(h.esn_spectral_radius  == 0.95f);
-        assert(h.esn_sparsity         == 0.1f);
-        assert(h.esn_leaking_rate     == 1.0f);
-        assert(h.esn_input_scaling    == 1.0f);
-        assert(h.esn_feedback_scaling == 0.0f);
-        assert(h.esn_noise_level      == 0.0f);
-        assert(h.esn_activation_type  == 0);
-        assert(h.esn_bidirectional    == false);
+        llama_hparams hparams;
+
+        // Verify default ESN parameter values
+        assert(hparams.esn_reservoir_size == 0);       // Should be set when loading model
+        assert(hparams.esn_spectral_radius == 0.95f);  // Conservative default
+        assert(hparams.esn_sparsity == 0.1f);          // 10% connectivity
+        assert(hparams.esn_leaking_rate == 1.0f);      // No leaky integration by default
+        assert(hparams.esn_input_scaling == 1.0f);     // No scaling by default
+
+        // Extended ESN defaults
+        assert(hparams.esn_feedback_scaling == 0.0f);  // Feedback disabled by default
+        assert(hparams.esn_noise_level      == 0.0f);       // No noise by default
+        assert(hparams.esn_activation_type == 0);      // tanh by default
+        assert(hparams.esn_bidirectional    == false);    // Causal by default
         std::cout << "PASSED\n";
     }
 

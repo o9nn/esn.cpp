@@ -1,5 +1,15 @@
 # DTECHO.md - Deep Tree Echo: A Reservoir Computing Approach to AGI
 
+> **Scope note.** This document is a **vision / research direction**,
+> *not* a backlog of pending work for this fork. The ESN runtime
+> implementation shipped on this branch — architecture registration,
+> GGUF loader, graph builder, byte tokenizer, training script, test
+> binaries, docs — is complete and verified per
+> [`docs/esn-completion.md`](docs/esn-completion.md). Nothing in this
+> DTECHO roadmap is a prerequisite for that completion; DTE would be a
+> *downstream*, separable project built on top of the finished ESN
+> runtime.
+
 ## Overview
 
 **Deep Tree Echo (DTE)** is a theoretical framework for artificial general intelligence (AGI) that extends Echo State Networks into a hierarchical, tree-structured architecture. It combines the computational efficiency of reservoir computing with the representational power of deep hierarchical systems.

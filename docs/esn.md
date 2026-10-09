@@ -2,6 +2,10 @@
 
 This document describes the implementation of Echo State Networks (ESNs) in llama.cpp, providing a comprehensive model for reservoir computing within the ggml framework.
 
+> **See also:** [`docs/esn-completion.md`](esn-completion.md) — the explicit
+> completion contract for the ESN work: scope, criteria, and the exact
+> file / test / measurement that satisfies each criterion.
+
 ## What are Echo State Networks?
 
 Echo State Networks are a type of recurrent neural network that belongs to the reservoir computing paradigm. ESNs consist of three main components:
@@ -16,18 +20,27 @@ The key insight of ESNs is that only the output weights need to be trained, whil
 
 ### Core ESN Equation
 
-The ESN dynamics are governed by:
+The full ESN dynamics implemented by `llm_build_esn` are:
 
 ```
-x(t+1) = (1-α) * x(t) + α * tanh(W_res * x(t) + W_in * u(t))
+x(t+1) = (1-α) * x(t) + α * f(W_res * x(t) + W_in * u(t) + W_fb * y(t-1) + b)
+y(t)   = W_out * x(t)
 ```
 
 Where:
 - `x(t)` is the reservoir state at time t
-- `u(t)` is the input at time t  
+- `u(t)` is the input embedding at time t
+- `y(t)` is the output projection at time t
 - `W_res` is the reservoir weight matrix (with spectral radius < 1)
 - `W_in` is the input weight matrix
+- `W_fb` is the optional output-to-reservoir feedback matrix
+- `W_out` is the trained output readout matrix
+- `b` are the optional input/reservoir bias vectors
+- `f` is the activation function (tanh, sigmoid, or leaky-relu)
 - `α` is the leaking rate (controls memory vs. adaptation trade-off)
+
+The feedback term `W_fb * y(t-1)` is only included when `esn_feedback_scaling > 0`
+and the `esn_feedback_weights` tensor is present in the GGUF file.
 
 ### Model Components
 
@@ -69,13 +82,36 @@ ESNs are implemented as a recurrent architecture in llama.cpp, leveraging the ex
 
 ### Forward Pass Implementation
 
-The ESN forward pass consists of:
+The ESN forward pass (`llm_build_esn` in `src/llama-model.cpp`) consists of:
 
-1. **Input Projection**: `W_in * input_embeddings`
-2. **State Retrieval**: Get previous reservoir state from recurrent memory
-3. **Reservoir Update**: Apply ESN dynamics with leaky integration
-4. **State Storage**: Store new reservoir state for next timestep
-5. **Output Projection**: `W_out * reservoir_state → vocabulary_logits`
+1. **Input Projection**: `W_in * input_embeddings`, scaled by `esn_input_scaling`,
+   plus optional `esn_input_bias`
+2. **State Retrieval**: Get previous reservoir state via
+   `llama_memory_recurrent_context::get_s_l(0)` and `build_rs()`
+3. **Recurrent Projection**: `W_res * x(t)`
+4. **Optional Feedback**: When `esn_feedback_scaling > 0` and
+   `esn_feedback_weights` is loaded, add
+   `esn_feedback_scaling * W_fb * (W_out * x(t))` to the pre-activation
+5. **Optional Reservoir Bias**: Add `esn_reservoir_bias`
+6. **Activation**: Apply the selected activation (`esn_activation_type`:
+   tanh, sigmoid, or gelu as a leaky-relu proxy)
+7. **Leaky Integration**: `x(t+1) = (1-α)*x(t) + α*f(...)`
+8. **State Storage**: `ggml_cpy` new state back to `esn_states_all` at
+   `kv_head * reservoir_size`
+9. **Output Normalization & Projection**: RMS norm, then
+   `W_out * reservoir_state → vocabulary_logits`
+
+Notes on features that live outside the inference path:
+
+- **`esn_noise_level`**: injected into the reservoir update during Python
+  training (`scripts/esn_training.py`) for regularization; omitted from the
+  deterministic inference graph
+- **`esn_bidirectional`**: affects how `W_res` is initialized at training
+  time; inference remains strictly causal/forward to preserve streaming
+  semantics
+- **`esn_spectral_radius`, `esn_sparsity`**: baked into the reservoir
+  weight matrix at training time; the inference graph does not need to see
+  them beyond metadata
 
 ### Memory Management
 
@@ -232,22 +268,89 @@ ESN models integrate seamlessly with:
 - **llama-quantize**: Model quantization
 - **Python bindings**: Through llama-cpp-python
 
+## End-to-End Usage
+
+The full pipeline from an untrained reservoir to running inference:
+
+```bash
+# 1. Train (or just initialize) an ESN model and export as GGUF.
+#    See "Training ESN Models" below for all flags.
+python scripts/esn_training.py \
+    --reservoir-size 1024 \
+    --spectral-radius 0.95 \
+    --leaking-rate 0.3 \
+    --activation tanh \
+    --output esn-model.gguf
+
+# 2. Build llama-cli (and the ESN inference smoke test).
+cmake -B build
+cmake --build build -j --target llama-cli test-esn-inference
+
+# 3. Verify the pipeline on raw token IDs (no tokenizer needed).
+build/bin/test-esn-inference esn-model.gguf
+```
+
+### Tokenizer
+
+`scripts/esn_training.py` writes a 256-token byte-level tokenizer by
+default (the `--tokenizer byte` mode), using the RWKV-style escape format
+llama.cpp supports. Any input string is split into its UTF-8 bytes and
+each byte becomes its own token, which gives:
+
+- `llama-cli -p "..."` works directly, no extra setup
+- `vocab_size` is pinned to 256 (the script will override larger values
+  with a warning so training/inference stay consistent)
+- Round-trip is exact — a model that memorizes a byte-sequence produces
+  that sequence back verbatim
+
+For non-text sequence-learning use cases (where the ESN is driven with
+raw token IDs via `llama_batch_get_one`, as in
+`tests/test-esn-inference.cpp`), pass `--tokenizer none` to emit the
+`no_vocab` stub instead. The model loads but `llama-cli -p "..."` will
+not work on it.
+
+Switching to a larger pretrained tokenizer (SPM/BPE) is a straightforward
+extension of `_write_tokenizer()` — call `writer.add_tokenizer_model(...)`,
+`writer.add_token_list(...)`, `writer.add_token_scores(...)`, and
+`writer.add_token_types(...)` with the data from any compatible GGUF.
+
+### Hyperparameter split: inference-time vs training-time
+
+- Inference-time (consumed by `llm_build_esn`): activation choice, feedback
+  (when `esn_feedback_scaling > 0` and `esn_feedback_weights` are in the GGUF),
+  input bias, reservoir bias, leaky integration, input scaling.
+- Training-time-only: noise injection, bidirectional reservoir
+  initialization, spectral radius scaling, sparsity masking.
+
 ## Testing
 
 Run ESN-specific tests:
 
 ```bash
-# Build and run ESN tests
+# Static architecture tests (no model file needed)
 cmake --build build --target test-esn
 ctest --test-dir build -R test-esn --verbose
+
+# End-to-end inference smoke test (loads a real GGUF, runs llama_decode)
+cmake --build build --target test-esn-inference
+python scripts/esn_training.py --init-only --reservoir-size 128 \
+    --vocab-size 1024 --embedding-dim 64 --output /tmp/esn-smoke.gguf
+build/bin/test-esn-inference /tmp/esn-smoke.gguf
 ```
 
-Test coverage includes:
-- Architecture recognition
-- Tensor mapping validation  
-- Hyperparameter initialization
-- Recurrent memory integration
-- Forward pass computation
+Static test coverage (`tests/test-esn.cpp`):
+- Architecture recognition and name mapping
+- Recurrent / hybrid / diffusion classification
+- Tensor info mappings for all 6 ESN tensors (weights + biases + feedback)
+- Hyperparameter defaults (base + extended)
+- Tensor name generation
+- `n_embd_s()` returns `reservoir_size` for ESN models
+
+End-to-end inference coverage (`tests/test-esn-inference.cpp`):
+- GGUF metadata & tensor-shape loading for `arch=esn`
+- `llama_memory_recurrent` allocation sized by `n_embd_s()`
+- `llm_build_esn` forward graph construction and execution
+- `llama_decode` success and finite logits
 
 ## Training ESN Models
 
@@ -289,15 +392,30 @@ ESN training uses ridge regression on output weights only:
 3. **Ridge Regression**: `W_out = Y^T * X * (X^T * X + λI)^(-1)`
 4. **GGUF Export**: Save trained model for llama.cpp inference
 
-## Future Enhancements
+## Related research directions (not part of this implementation)
 
-Potential future improvements:
+The items below are a **separate research roadmap**, not pending work on
+the ESN runtime shipped in this fork. The ESN implementation described
+above (architecture registration, GGUF loader, graph builder, byte
+tokenizer, training script, three test binaries, docs) is complete per
+[`docs/esn-completion.md`](esn-completion.md); none of the items in this
+section are prerequisites for that completion.
 
-1. **Hierarchical ESNs**: Multi-layer reservoir architectures (see `DTECHO.md`)
-2. **Advanced Initialization**: Dynamic spectral radius adaptation
-3. **Adaptive Parameters**: Dynamic leaking rate tuning
-4. **Sparse Operations**: Optimized sparse matrix operations for reservoir computation
-5. **Deep Tree Echo**: Hierarchical AGI architecture exploration
+These are directions a *downstream* project could take; they would be
+new, separable PRs if they were pursued:
+
+1. **Hierarchical ESNs** — Multi-layer reservoir architectures. See
+   `DTECHO.md`, which is a vision document describing a possible
+   Deep-Tree-Echo architecture built *on top of* this ESN runtime.
+2. **Advanced initialization** — Dynamic spectral-radius adaptation.
+3. **Adaptive hyperparameters** — Online tuning of the leaking rate.
+4. **Sparse operations** — A dedicated sparse `ggml_mul_mat` path for
+   the reservoir weight matrix (currently it runs as dense).
+5. **Larger benchmarks** — Transformer-vs-ESN comparisons on
+   WikiText-scale corpora with a GPU training pipeline.
+
+Items 1–5 do not block the goal of integrating ESNs into the llama.cpp
+runtime, which is the scope of this fork.
 
 ## ESLLM: Synchronous Infer-Train Architecture
 
