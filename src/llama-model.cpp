@@ -2064,7 +2064,26 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                 ml.get_key(LLM_KV_ESN_ACTIVATION_TYPE,  hparams.esn_activation_type, false);
                 ml.get_key(LLM_KV_ESN_BIDIRECTIONAL,    hparams.esn_bidirectional, false);
 
+                // Online learning configuration (optional, defaults to disabled)
+                ml.get_key(LLM_KV_ESN_ONLINE_LEARNING_ENABLED, hparams.esn_online_learning,    false);
+                ml.get_key(LLM_KV_ESN_ONLINE_LEARNING_RATE,    hparams.esn_online_lr,           false);
+                ml.get_key(LLM_KV_ESN_ONLINE_REGULARIZATION,   hparams.esn_online_reg,          false);
+                ml.get_key(LLM_KV_ESN_ONLINE_BUFFER_SIZE,      hparams.esn_online_buffer_size,  false);
+                ml.get_key(LLM_KV_ESN_ONLINE_UPDATE_MODE,      hparams.esn_online_update_mode,  false);
+                ml.get_key(LLM_KV_ESN_ONLINE_DECAY_RATE,       hparams.esn_online_decay_rate,   false);
+                ml.get_key(LLM_KV_ESN_FREEZE_RESERVOIR,        hparams.esn_freeze_reservoir,    false);
+                ml.get_key(LLM_KV_ESN_REPLAY_WINDOW,           hparams.esn_replay_window,       false);
+
+                // Hierarchical / DTE configuration (optional, defaults to flat single-level ESN)
+                ml.get_key(LLM_KV_ESN_N_LEVELS,         hparams.esn_n_levels,         false);
+                ml.get_key(LLM_KV_ESN_BRANCHING_FACTOR, hparams.esn_branching_factor, false);
+                ml.get_key(LLM_KV_ESN_LATERAL_LINKS,    hparams.esn_lateral_links,    false);
+                ml.get_key(LLM_KV_ESN_TOP_DOWN_MOD,     hparams.esn_top_down_mod,     false);
+
                 ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+
+                // Validate all ESN parameters now that they are loaded
+                hparams.validate_esn_params();
 
                 switch (hparams.n_layer) {
                     case 1: type = LLM_TYPE_SMALL; break;

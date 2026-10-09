@@ -136,7 +136,7 @@ struct llama_hparams {
 
     bool ssm_dt_b_c_rms = false;
 
-    // for Echo State Networks
+    // for Echo State Networks – static reservoir configuration
     uint32_t esn_reservoir_size   = 0;
     float    esn_spectral_radius  = 0.95f;
     float    esn_sparsity         = 0.1f;
@@ -146,6 +146,22 @@ struct llama_hparams {
     float    esn_noise_level      = 0.0f;    // noise injection for regularization
     uint32_t esn_activation_type  = 0;       // 0=tanh, 1=sigmoid, 2=leaky_relu
     bool     esn_bidirectional    = false;   // bidirectional reservoir processing
+
+    // ESN online learning / infer-train (Phase 3)
+    bool     esn_online_learning    = false;  // enable online readout adaptation
+    float    esn_online_lr          = 1e-4f;  // online learning rate for RLS/SGD
+    float    esn_online_reg         = 1e-6f;  // L2 regularization coefficient
+    uint32_t esn_online_buffer_size = 64;     // experience replay buffer capacity (tokens)
+    uint32_t esn_online_update_mode = 0;      // 0=batch_ridge, 1=rls, 2=sgd
+    float    esn_online_decay_rate  = 0.0f;   // exponential weight decay for forgetting
+    bool     esn_freeze_reservoir   = true;   // keep reservoir weights fixed (default true)
+    uint32_t esn_replay_window      = 256;    // sliding window size for replay-based updates
+
+    // ESN hierarchical / Deep Tree Echo configuration (Phase 6)
+    uint32_t esn_n_levels         = 1;       // number of hierarchical reservoir levels (1 = flat ESN)
+    uint32_t esn_branching_factor = 3;       // child reservoirs per parent node in tree structures
+    bool     esn_lateral_links    = false;   // lateral connections between same-level reservoirs
+    bool     esn_top_down_mod     = false;   // top-down modulation from higher levels to lower
 
     float f_clamp_kqv      = 0.0f;
     float f_max_alibi_bias = 0.0f;
@@ -256,6 +272,10 @@ struct llama_hparams {
     bool is_swa(uint32_t il) const;
 
     bool has_kv(uint32_t il) const;
+
+    // Validate ESN hyperparameters; throws std::invalid_argument on constraint violation.
+    // Call this after loading ESN model parameters to catch misconfigured models early.
+    void validate_esn_params() const;
 
     // number of layers for which has_kv() returns true
     uint32_t n_layer_kv() const;
