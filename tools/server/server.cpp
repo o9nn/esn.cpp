@@ -2575,6 +2575,7 @@ struct server_context {
 
         // if context shifting is disabled, make sure that we don't run out of context
         if (!params_base.ctx_shift && slot.n_past + 1 >= slot.n_ctx) {
+            slot.truncated      = true;
             slot.stop           = STOP_TYPE_LIMIT;
             slot.has_next_token = false;
 
