@@ -27,6 +27,7 @@ License: MIT
 
 import argparse
 import json
+import logging
 import numpy as np
 from pathlib import Path
 from typing import Optional, Tuple, Dict, Any, Callable
@@ -42,12 +43,14 @@ if _GGUF_PY.is_dir():
     sys.path.insert(0, str(_GGUF_PY))
 
 try:
-    from gguf import GGUFWriter, GGMLQuantizationType
+    from gguf import GGUFWriter
 except ImportError as e:
     raise SystemExit(
         "The 'gguf' package is required. Install the one bundled with this\n"
         "repository by running: pip install -e gguf-py"
     ) from e
+
+logger = logging.getLogger("esn-training")
 
 # Activation type constants (must match llama-hparams.h)
 ACTIVATION_TANH = 0
@@ -96,8 +99,8 @@ class ESNConfig:
         if self.tokenizer == "byte" and self.vocab_size != 256:
             # Byte tokenizer must have vocab == 256. Auto-correct and warn
             # rather than silently producing a broken model.
-            print(f"[ESNConfig] tokenizer='byte' requires vocab_size=256; "
-                  f"overriding vocab_size {self.vocab_size} -> 256")
+            logger.warning(f"[ESNConfig] tokenizer='byte' requires vocab_size=256; "
+                           f"overriding vocab_size {self.vocab_size} -> 256")
             self.vocab_size = 256
 
     @classmethod
@@ -236,11 +239,11 @@ class ESN:
 
     def initialize(self) -> None:
         """Initialize all weight matrices according to ESN principles."""
-        print(f"Initializing ESN with reservoir size {self.config.reservoir_size}")
-        print(f"  Activation: {['tanh', 'sigmoid', 'leaky_relu'][self.config.activation_type]}")
-        print(f"  Feedback scaling: {self.config.feedback_scaling}")
-        print(f"  Bidirectional: {self.config.bidirectional}")
-        print(f"  Use bias: {self.config.use_bias}")
+        logger.info(f"Initializing ESN with reservoir size {self.config.reservoir_size}")
+        logger.info(f"  Activation: {['tanh', 'sigmoid', 'leaky_relu'][self.config.activation_type]}")
+        logger.info(f"  Feedback scaling: {self.config.feedback_scaling}")
+        logger.info(f"  Bidirectional: {self.config.bidirectional}")
+        logger.info(f"  Use bias: {self.config.use_bias}")
 
         # Token embeddings (random initialization, to be learned or loaded)
         self.tok_embd = self.rng.standard_normal(
@@ -274,7 +277,7 @@ class ESN:
             self.W_fb = self.rng.standard_normal(
                 (self.config.reservoir_size, self.config.vocab_size)
             ).astype(np.float32) * self.config.feedback_scaling
-            print(f"  Initialized feedback weights")
+            logger.info("  Initialized feedback weights")
 
         # Optional: bias vectors
         if self.config.use_bias:
@@ -282,10 +285,10 @@ class ESN:
             self.b_res = self.rng.standard_normal(
                 self.config.reservoir_size
             ).astype(np.float32) * 0.1
-            print(f"  Initialized bias vectors")
+            logger.info("  Initialized bias vectors")
 
         self._initialized = True
-        print("ESN initialization complete")
+        logger.info("ESN initialization complete")
 
     def _init_reservoir_weights(self) -> None:
         """
@@ -316,9 +319,9 @@ class ESN:
         self.W_res = weights
 
         method = "exact" if size <= _EXACT_EIGVALS_MAX_SIZE else "Arnoldi estimate"
-        print(f"  Reservoir spectral radius: {self.config.spectral_radius} "
-              f"(unscaled radius {radius:.4f}, {method})")
-        print(f"  Reservoir sparsity: {1 - np.count_nonzero(self.W_res) / self.W_res.size:.2%} zeros")
+        logger.info(f"  Reservoir spectral radius: {self.config.spectral_radius} "
+                    f"(unscaled radius {radius:.4f}, {method})")
+        logger.info(f"  Reservoir sparsity: {1 - np.count_nonzero(self.W_res) / self.W_res.size:.2%} zeros")
 
     def forward(
         self,
@@ -511,7 +514,7 @@ class ESN:
         XtY = np.zeros((size, vocab), dtype=np.float64)
         kept_X, kept_y, n_rows = [], [], 0
         for start, states in self._state_batches(inputs):
-            print(f"  Processing sequence {start}/{len(inputs)}")
+            logger.info(f"  Processing sequence {start}/{len(inputs)}")
             X = self._readout_features(states[:, washout:].reshape(-1, states.shape[-1]))
             y = targets[start:start + len(states), washout:].reshape(-1)
             Y = np.zeros((len(y), vocab), dtype=np.float32)
@@ -576,7 +579,7 @@ class ESN:
         if calibrate and self.W_fb is not None:
             # llm_build_esn feeds W_out·x back into the reservoir, so scaling
             # W_out would also change the recurrence it was trained on.
-            print("Skipping readout calibration: with feedback enabled, W_out also drives the reservoir")
+            logger.info("Skipping readout calibration: with feedback enabled, W_out also drives the reservoir")
             calibrate = False
 
         n_seq = len(token_sequences)
@@ -586,7 +589,7 @@ class ESN:
         n_train = n_seq - n_val - (1 if n_val else 0)
         keep_rows = max(1, _STATE_BATCH_FLOATS // self.config.reservoir_size)
 
-        print(f"Collecting reservoir states (washout={washout})...")
+        logger.info(f"Collecting reservoir states (washout={washout})...")
         XtX, XtY, n_rows, X_fit, y_fit = self._normal_equations(
             token_sequences[:n_train], target_sequences[:n_train], washout, keep_rows)
 
@@ -598,39 +601,39 @@ class ESN:
             bits = 1.0 / np.log(2.0)
 
             if reg_grid:
-                print("  ridge penalty   validation NLL (bits/token, temperature-fitted)")
+                logger.info("  ridge penalty   validation NLL (bits/token, temperature-fitted)")
                 scores = []
                 for cand in reg_grid:
                     Z = X_val @ self._ridge_solve(XtX, XtY, cand).T
                     scores.append(softmax_nll(Z, y_val, fit_temperature(Z, y_val)) * bits)
-                    print(f"  {cand:13.3g}   {scores[-1]:.4f}")
+                    logger.info(f"  {cand:13.3g}   {scores[-1]:.4f}")
                 lam = float(reg_grid[int(np.argmin(scores))])
                 self.config.regularization = lam
-                print(f"  selected ridge penalty {lam:.3g}")
+                logger.info(f"  selected ridge penalty {lam:.3g}")
 
             Z = X_val @ self._ridge_solve(XtX, XtY, lam).T
             if calibrate:
                 self.output_temperature = fit_temperature(Z, y_val)
-            print(f"Validation ({n_val_rows} tokens): "
-                  f"accuracy {np.mean(np.argmax(Z, axis=1) == y_val):.4f}, "
-                  f"NLL {softmax_nll(Z, y_val, 1.0) * bits:.4f} -> "
-                  f"{softmax_nll(Z, y_val, self.output_temperature) * bits:.4f} bits/token "
-                  f"at logit scale {self.output_temperature:.4g}")
+            logger.info(f"Validation ({n_val_rows} tokens): "
+                        f"accuracy {np.mean(np.argmax(Z, axis=1) == y_val):.4f}, "
+                        f"NLL {softmax_nll(Z, y_val, 1.0) * bits:.4f} -> "
+                        f"{softmax_nll(Z, y_val, self.output_temperature) * bits:.4f} bits/token "
+                        f"at logit scale {self.output_temperature:.4g}")
 
             XtX += val_XtX
             XtY += val_XtY
             n_rows += n_val_rows
             del val_XtX, val_XtY
         elif calibrate:
-            print("Skipping readout calibration: need at least 10 sequences to hold out from")
+            logger.info("Skipping readout calibration: need at least 10 sequences to hold out from")
 
-        print(f"Training output weights on {n_rows} samples "
-              f"(state dim: {self.config.reservoir_size}, ridge penalty {lam:.3g})...")
+        logger.info(f"Training output weights on {n_rows} samples "
+                    f"(state dim: {self.config.reservoir_size}, ridge penalty {lam:.3g})...")
         self.W_out = self._ridge_solve(XtX, XtY, lam)
 
         accuracy = float(np.mean(np.argmax(X_fit @ self.W_out.T, axis=1) == y_fit))
-        print(f"Training complete. Accuracy: {accuracy:.4f}"
-              + (f" (first {len(y_fit)} samples)" if len(y_fit) < n_rows else ""))
+        logger.info(f"Training complete. Accuracy: {accuracy:.4f}"
+                    + (f" (first {len(y_fit)} samples)" if len(y_fit) < n_rows else ""))
 
         return accuracy
 
@@ -656,7 +659,7 @@ class ESN:
         lam = max(self.config.regularization, 1e-9)
         # Inverse correlation matrix P:  P = (1/λ) I
         self._rls_P = np.eye(rsz, dtype=np.float32) * (1.0 / lam)
-        print(f"RLS initialised: reservoir_size={rsz}, λ={lam:.2e}")
+        logger.info(f"RLS initialised: reservoir_size={rsz}, λ={lam:.2e}")
 
     def rls_update(
         self,
@@ -849,7 +852,7 @@ class ESN:
         if not self._initialized:
             raise RuntimeError("ESN not initialized. Call initialize() first.")
 
-        print(f"Saving model to {path}")
+        logger.info(f"Saving model to {path}")
 
         writer = GGUFWriter(path=path, arch="esn")
 
@@ -949,7 +952,7 @@ class ESN:
         writer.write_tensors_to_file()
         writer.close()
 
-        print(f"Model saved successfully ({os.path.getsize(path) / 1e6:.1f} MB)")
+        logger.info(f"Model saved successfully ({os.path.getsize(path) / 1e6:.1f} MB)")
 
     def _write_tokenizer(self, writer: GGUFWriter) -> None:
         """Write the tokenizer section to the GGUF file.
@@ -1072,7 +1075,7 @@ def load_text_training_data(
     inputs_arr  = np.stack(inputs,  axis=0)
     targets_arr = np.stack(targets, axis=0)
 
-    print(
+    logger.info(
         f"Loaded {len(inputs_arr)} windows of length {seq_length} from "
         f"{path} ({len(data)} bytes)"
     )
@@ -1186,6 +1189,7 @@ Examples:
                         help="Save config to JSON file")
 
     args = parser.parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
 
     # Map activation name to type
     activation_map = {
@@ -1220,9 +1224,9 @@ Examples:
     # Save config if requested
     if args.save_config:
         config.to_json(args.save_config)
-        print(f"Config saved to {args.save_config}")
+        logger.info(f"Config saved to {args.save_config}")
 
-    print(f"ESN Configuration: {config}")
+    logger.info(f"ESN Configuration: {config}")
 
     # Create and initialize ESN
     esn = ESN(config)
@@ -1233,7 +1237,7 @@ Examples:
     if not args.init_only:
         # Load or create training data
         if args.train_data:
-            print(f"Loading training data from {args.train_data}")
+            logger.info(f"Loading training data from {args.train_data}")
             input_seqs, target_seqs = load_text_training_data(
                 args.train_data,
                 config.vocab_size,
@@ -1241,7 +1245,7 @@ Examples:
                 max_sequences=args.n_sequences,
             )
         else:
-            print("Using sample training data (for testing only)")
+            logger.info("Using sample training data (for testing only)")
             input_seqs, target_seqs = create_sample_training_data(
                 config.vocab_size, args.n_sequences, args.seq_length, config.seed
             )
@@ -1250,7 +1254,7 @@ Examples:
             # ---------------------------------------------------------- #
             # Online / incremental training (Phase 3 – ESLLM infer-train) #
             # ---------------------------------------------------------- #
-            print(f"\nOnline training mode: {args.online_mode.upper()}")
+            logger.info(f"\nOnline training mode: {args.online_mode.upper()}")
             if args.online_mode == "rls":
                 # Override regularisation for RLS initialisation
                 config.regularization = args.online_reg
@@ -1272,12 +1276,12 @@ Examples:
                 total_loss    += stats["mean_loss"] * stats["n_updates"]
                 if seq_idx % 100 == 0:
                     mean_so_far = total_loss / max(total_updates, 1)
-                    print(f"  Seq {seq_idx}/{len(input_seqs)}  "
-                          f"mean_loss={mean_so_far:.4f}  updates={total_updates}")
+                    logger.info(f"  Seq {seq_idx}/{len(input_seqs)}  "
+                                f"mean_loss={mean_so_far:.4f}  updates={total_updates}")
 
             mean_loss = total_loss / max(total_updates, 1)
-            print(f"\nOnline training complete.  "
-                  f"Total updates: {total_updates}  Mean loss: {mean_loss:.4f}")
+            logger.info(f"\nOnline training complete.  "
+                        f"Total updates: {total_updates}  Mean loss: {mean_loss:.4f}")
 
             # Embed online-learning metadata in the GGUF file if requested
             if args.save_online_metadata:
@@ -1295,7 +1299,7 @@ Examples:
                 config.freeze_reservoir     = True
                 config.replay_window        = 256
                 esn.config = config
-                print("Online learning metadata will be embedded in GGUF.")
+                logger.info("Online learning metadata will be embedded in GGUF.")
         else:
             # Batch ridge regression (original mode)
             reg_grid = None
@@ -1305,13 +1309,13 @@ Examples:
                                  val_fraction=args.val_fraction,
                                  calibrate=not args.no_calibrate,
                                  reg_grid=reg_grid)
-            print(f"Final training accuracy: {accuracy:.4f}")
+            logger.info(f"Final training accuracy: {accuracy:.4f}")
 
     # Save to GGUF
     esn.save_gguf(args.output)
-    print(f"\nModel saved to {args.output}")
-    print("\nTo use with llama.cpp:")
-    print(f"  ./llama-cli -m {args.output} -p \"Your prompt here\"")
+    logger.info(f"\nModel saved to {args.output}")
+    logger.info("\nTo use with llama.cpp:")
+    logger.info(f"  ./llama-cli -m {args.output} -p \"Your prompt here\"")
 
 
 if __name__ == "__main__":
