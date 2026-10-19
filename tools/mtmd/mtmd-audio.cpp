@@ -8,6 +8,7 @@
 #include <vector>
 #include <fstream>
 #include <algorithm>
+#include <functional>
 
 // most of the code here is copied from whisper.cpp
 
