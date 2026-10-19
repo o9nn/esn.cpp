@@ -19391,7 +19391,7 @@ struct llm_build_apertus : public llm_graph_context {
 //   x(t+1) = (1-α)*x(t) + α*f(W_res*x(t) + W_in*u(t) + W_fb*y(t-1) + b)
 //
 // Features:
-//   - Configurable activation (tanh / sigmoid / gelu as leaky-relu proxy)
+//   - Configurable activation (tanh / sigmoid / leaky-relu)
 //   - Optional output-to-reservoir feedback (feedback_scaling > 0, W_fb present)
 //   - Optional input and reservoir bias tensors
 //   - Leaky integration via leaking_rate
@@ -19409,8 +19409,8 @@ struct llm_build_esn : public llm_graph_context_mamba {
         switch (activation_type) {
             case 1:  // sigmoid
                 return ggml_sigmoid(ctx0, x);
-            case 2:  // leaky_relu (approximated with gelu for now)
-                return ggml_gelu(ctx0, x);
+            case 2:  // leaky_relu, same 0.01 slope as scripts/esn_training.py
+                return ggml_leaky_relu(ctx0, x, 0.01f, false);
             default: // 0 = tanh (default)
                 return ggml_tanh(ctx0, x);
         }
@@ -19511,10 +19511,14 @@ struct llm_build_esn : public llm_graph_context_mamba {
 
             ggml_tensor * activated = apply_esn_activation(pre, activation_type);
 
-            // Leaky integration.
-            ggml_tensor * leaky_old = ggml_scale(ctx0, state,     1.0f - leaking_rate);
-            ggml_tensor * leaky_new = ggml_scale(ctx0, activated, leaking_rate);
-            state = ggml_add(ctx0, leaky_old, leaky_new);
+            // Leaky integration (a no-op blend at leaking_rate == 1).
+            if (leaking_rate == 1.0f) {
+                state = activated;
+            } else {
+                ggml_tensor * leaky_old = ggml_scale(ctx0, state,     1.0f - leaking_rate);
+                ggml_tensor * leaky_new = ggml_scale(ctx0, activated, leaking_rate);
+                state = ggml_add(ctx0, leaky_old, leaky_new);
+            }
 
             per_token.push_back(state);
         }
@@ -19538,13 +19542,27 @@ struct llm_build_esn : public llm_graph_context_mamba {
             cur = ggml_reshape_2d(ctx0, per_token[0], reservoir_size, n_seqs);
         } else {
             // Stack timesteps along axis 1, then flatten (n_seq_tokens, n_seqs)
-            // down into the single n_tokens axis llama.cpp expects.
-            cur = ggml_reshape_3d(ctx0, per_token[0], reservoir_size, 1, n_seqs);
-            for (int64_t t = 1; t < n_seq_tokens; ++t) {
-                ggml_tensor * nxt = ggml_reshape_3d(ctx0, per_token[t], reservoir_size, 1, n_seqs);
-                cur = ggml_concat(ctx0, cur, nxt, 1);
+            // down into the single n_tokens axis llama.cpp expects. Concatenate
+            // pairwise in a balanced tree: each state is copied log2(n) times,
+            // where a left-to-right chain re-copies the growing prefix at every
+            // step (O(n^2) bytes, which dominated long prompt prefill).
+            std::vector<ggml_tensor *> level;
+            level.reserve(n_seq_tokens);
+            for (ggml_tensor * s : per_token) {
+                level.push_back(ggml_reshape_3d(ctx0, s, reservoir_size, 1, n_seqs));
             }
-            cur = ggml_reshape_2d(ctx0, cur, reservoir_size, n_tokens);
+            while (level.size() > 1) {
+                std::vector<ggml_tensor *> next;
+                next.reserve((level.size() + 1) / 2);
+                for (size_t i = 0; i + 1 < level.size(); i += 2) {
+                    next.push_back(ggml_concat(ctx0, level[i], level[i + 1], 1));
+                }
+                if (level.size() % 2 == 1) {
+                    next.push_back(level.back());
+                }
+                level = std::move(next);
+            }
+            cur = ggml_reshape_2d(ctx0, level[0], reservoir_size, n_tokens);
         }
         cb(cur, "esn_reservoir_seq", -1);
 

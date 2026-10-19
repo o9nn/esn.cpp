@@ -118,7 +118,15 @@ python scripts/esn_training.py --config config.json
 
 # Initialize only (no training)
 python scripts/esn_training.py --init-only --output untrained.gguf
+
+# Large reservoir: pick λ on held-out data, store W_res as F16
+python scripts/esn_training.py --reservoir-size 8192 --reg-grid 1,10,100,1000 \
+    --outtype f16 --train-data corpus.txt --output model.gguf
 ```
+
+Batch training holds out `--val-fraction` (default 10%) of the sequences to
+pick λ from `--reg-grid` and to fit a softmax temperature that is folded into
+`W_out` (disable with `--no-calibrate`).
 
 ## Common Tasks
 

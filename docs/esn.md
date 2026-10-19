@@ -94,11 +94,14 @@ The ESN forward pass (`llm_build_esn` in `src/llama-model.cpp`) consists of:
    `esn_feedback_scaling * W_fb * (W_out * x(t))` to the pre-activation
 5. **Optional Reservoir Bias**: Add `esn_reservoir_bias`
 6. **Activation**: Apply the selected activation (`esn_activation_type`:
-   tanh, sigmoid, or gelu as a leaky-relu proxy)
-7. **Leaky Integration**: `x(t+1) = (1-α)*x(t) + α*f(...)`
+   tanh, sigmoid, or leaky ReLU with slope 0.01, matching the training script)
+7. **Leaky Integration**: `x(t+1) = (1-α)*x(t) + α*f(...)` (skipped when α = 1)
 8. **State Storage**: `ggml_cpy` new state back to `esn_states_all` at
    `kv_head * reservoir_size`
-9. **Output Normalization & Projection**: RMS norm, then
+9. **Output Stacking**: for multi-token batches, the per-token states are
+   concatenated in a balanced binary tree (O(n log n) bytes copied rather
+   than O(n²) for a left-to-right chain)
+10. **Output Normalization & Projection**: RMS norm, then
    `W_out * reservoir_state → vocabulary_logits`
 
 Notes on features that live outside the inference path:
@@ -239,6 +242,15 @@ ESNs exhibit favorable scaling properties:
 2. **Initialization**: Reservoir weights should satisfy echo state property
 3. **Hyperparameter Sensitivity**: Performance depends critically on spectral radius
 4. **Limited Context**: No explicit attention mechanism for long-range dependencies
+5. **Output feedback**: training collects states with the softmax of the
+   initial random readout fed back through `W_fb` (which already includes
+   `esn_feedback_scaling`), while inference feeds back the trained
+   readout's raw logits and applies `esn_feedback_scaling` again, so models
+   trained with `--feedback-scaling > 0` run different dynamics at inference
+6. **Bidirectional training**: `--bidirectional` adds backward-pass states to
+   the readout features, and at position t those have already seen the
+   target token t+1; inference is forward-only, so training and validation
+   scores of such models overstate inference quality
 
 ### Best Practices
 
@@ -382,15 +394,71 @@ python scripts/esn_training.py --init-only --reservoir-size 2048 --output untrai
 | Leaking Rate | `--leaking-rate` | 0.3 | Memory vs adaptation trade-off |
 | Regularization | `--regularization` | 1e-6 | Ridge regression lambda |
 | Washout | `--washout` | 100 | Initial timesteps to discard |
+| Validation split | `--val-fraction` | 0.1 | Sequences held out to pick lambda and fit the temperature |
+| Lambda search | `--reg-grid` | (off) | Comma-separated lambdas, chosen by held-out NLL |
+| No calibration | `--no-calibrate` | (off) | Export raw ridge outputs as logits |
+| Reservoir type | `--outtype` | `f32` | `f16` halves the reservoir's size and its per-token read |
 
 ### Training Process
 
 ESN training uses ridge regression on output weights only:
 
-1. **Initialization**: Random reservoir and input weights (fixed)
-2. **State Collection**: Run input sequences through reservoir
-3. **Ridge Regression**: `W_out = Y^T * X * (X^T * X + λI)^(-1)`
-4. **GGUF Export**: Save trained model for llama.cpp inference
+1. **Initialization**: Random reservoir and input weights (fixed). The
+   reservoir is rescaled to the target spectral radius, computed exactly up
+   to R=2048 and estimated with a 128-step Arnoldi iteration above that
+   (`np.linalg.eigvals` is O(R³) and took longer than training at R=8192).
+2. **State Collection**: Run input sequences through the reservoir in
+   batches (one matrix-matrix product per timestep for the whole batch),
+   accumulating `XᵀX` and `XᵀY` without materializing `X`
+3. **Ridge Regression**: `W_out = Y^T * X * (X^T * X + λI)^(-1)`; with
+   `--reg-grid`, the λ with the lowest held-out NLL is used
+4. **Calibration**: ridge regression to one-hot targets produces
+   probability-scale outputs, so using them directly as logits gives a
+   nearly uniform softmax. A single logit scale β is fitted on the
+   held-out sequences (NLL is convex in β) and folded into `W_out`. It does
+   not change the argmax. Skipped for models with output feedback, where
+   `W_out` also drives the reservoir.
+5. **Refit and Export**: the readout is refit on training + held-out data
+   with the chosen λ and saved as GGUF for llama.cpp inference
+
+With `--outtype f16`, `W_res` is rounded to F16 before state collection, so
+the readout is trained on exactly the reservoir inference runs.
+
+### Measured Effect of the Training and Inference Optimizations
+
+Byte-level models (`--tokenizer byte --embedding-dim 128 --spectral-radius
+0.9 --leaking-rate 0.3 --sparsity 0.1 --seq-length 256 --washout 32`)
+trained on ~86 kB of this repository's markdown and evaluated with
+`test-esn-perplexity` on a separate ~9.6 kB held-out file; 4-thread CPU.
+"Before" is the previous training script and graph builder.
+
+| | R=2048 before | R=2048 after | R=8192 before | R=8192 after | R=8192 after, F16 |
+|---|---:|---:|---:|---:|---:|
+| sequences / λ | 500 / 1e-2 | 500 / 1e-2 | 300 / 1e-2 | 300 / 100 (searched) | 300 / 100 |
+| training wall time | 67 s | 24 s | 510 s | 128 s | 107 s |
+| held-out bits/byte | 7.776 | 5.767 | 7.664 | 5.653 | 5.653 |
+| held-out perplexity | 219.1 | 54.4 | 202.7 | 50.3 | 50.3 |
+| held-out argmax accuracy | 28.6 % | 28.6 % | 26.0 % | 28.6 % | 28.6 % |
+| GGUF size | 20 MB | 20 MB | 281 MB | 281 MB | 147 MB |
+| prompt processing, pp512 (tok/s) | 1236 | 3571 | 162 | 247 | 443 |
+| generation, tg128 (tok/s) | 2879 | 2701 | 203 | 229 | 404 |
+
+The R=2048 throughput numbers are an A/B of the old and new graph builder
+on the same model and machine (`llama-bench -r 10`); generation is
+unchanged within noise there, since a single-token step does no output
+stacking. At R=8192 generation is bound by reading `W_res` once per token
+(256 MiB in F32), so the F16 reservoir nearly doubles it. Fixing λ at
+R=8192 matters as much as calibration: at λ=1e-2 the readout overfits
+(93.7 % training vs 24.1 % validation accuracy) and calibration alone
+reaches only 6.70 bits/byte.
+
+With the Arnoldi spectral-radius estimate, R=16384 is now practical on the
+same 4-core machine: an F16 model (λ searched over 10/100/1000) trains in
+584 s, reaches 5.635 bits/byte (perplexity 49.7, argmax 29.9 %) on the same
+held-out file, and generates at 70 tok/s from a 536 MiB GGUF. The previous
+script had not finished initializing it after 30 minutes. That this barely
+improves on R=8192 shows the ~67k-sample corpus, not the reservoir, is the
+limit at this scale.
 
 ## Related research directions (not part of this implementation)
 
