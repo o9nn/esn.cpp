@@ -4,6 +4,7 @@
 
 #include <array>
 #include <cinttypes>
+#include <cstdlib>
 #include <cstring>
 #include <future>
 
