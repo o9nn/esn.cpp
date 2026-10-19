@@ -219,15 +219,16 @@ class ESN:
         self.rng = np.random.default_rng(config.seed)
         self.activation_fn = get_activation_fn(config.activation_type)
 
-        # Initialize weights
-        self.W_in = None      # Input weights
-        self.W_res = None     # Reservoir weights
-        self.W_out = None     # Output weights (trained)
-        self.W_fb = None      # Feedback weights (optional)
-        self.b_in = None      # Input bias (optional)
-        self.b_res = None     # Reservoir bias (optional)
-        self.tok_embd = None  # Token embeddings
-        self.output_norm = None  # Output normalization
+        # Weights. initialize() sets every non-optional one; until then they
+        # are empty placeholders, so their type is a plain ndarray.
+        self.W_in: np.ndarray = np.empty((0, 0), dtype=np.float32)      # Input weights
+        self.W_res: np.ndarray = np.empty((0, 0), dtype=np.float32)     # Reservoir weights
+        self.W_out: np.ndarray = np.empty((0, 0), dtype=np.float32)     # Output weights (trained)
+        self.W_fb: Optional[np.ndarray] = None    # Feedback weights (optional)
+        self.b_in: Optional[np.ndarray] = None    # Input bias (optional)
+        self.b_res: Optional[np.ndarray] = None   # Reservoir bias (optional)
+        self.tok_embd: np.ndarray = np.empty((0, 0), dtype=np.float32)  # Token embeddings
+        self.output_norm: np.ndarray = np.empty(0, dtype=np.float32)    # Output normalization
         # Ridge regression fits W_out to one-hot targets, so W_out @ x is on a
         # probability scale; inference treats it as logits. train() fits this
         # scale on held-out data and save_gguf() folds it into W_out.
