@@ -237,6 +237,7 @@ jobs:
         id: cmake_build
         run: |
           cmake -B build \
+            -DGGML_NATIVE=OFF \
             -DLLAMA_FATAL_WARNINGS=ON \
             -DGGML_RPC=ON
           cmake --build build --config Release -j $(nproc)
@@ -301,6 +302,7 @@ jobs:
         run: |
           cmake -B build \
             -DLLAMA_FATAL_WARNINGS=ON \
+            -DGGML_NATIVE=OFF \
             -DLLAMA_SANITIZE_${{ matrix.sanitizer }}=ON \
             -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
           cmake --build build --config ${{ matrix.build_type }} -j $(nproc)
@@ -311,6 +313,7 @@ jobs:
         run: |
           cmake -B build \
             -DLLAMA_FATAL_WARNINGS=ON \
+            -DGGML_NATIVE=OFF \
             -DLLAMA_SANITIZE_${{ matrix.sanitizer }}=ON \
             -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
             -DGGML_OPENMP=OFF
@@ -1314,10 +1317,17 @@ jobs:
         id: checkout
         uses: actions/checkout@v4
 
+      - name: CPU fingerprint
+        id: cpu
+        # ci/run.sh builds with -march=native, and ccache 4.5 hashes that flag
+        # literally, so key the cache on the runner's CPU features to never
+        # reuse objects built for a different CPU
+        run: echo "fingerprint=$(grep -E '^(model name|flags|CPU part|Features)' /proc/cpuinfo | sort -u | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.16
         with:
-          key: ggml-ci-x64-cpu-low-perf
+          key: ggml-ci-x64-cpu-low-perf-${{ steps.cpu.outputs.fingerprint }}
           evict-old-files: 1d
 
       - name: Dependencies
@@ -1339,10 +1349,17 @@ jobs:
         id: checkout
         uses: actions/checkout@v4
 
+      - name: CPU fingerprint
+        id: cpu
+        # ci/run.sh builds with -march=native, and ccache 4.5 hashes that flag
+        # literally, so key the cache on the runner's CPU features to never
+        # reuse objects built for a different CPU
+        run: echo "fingerprint=$(grep -E '^(model name|flags|CPU part|Features)' /proc/cpuinfo | sort -u | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.16
         with:
-          key: ggml-ci-arm64-cpu-low-perf
+          key: ggml-ci-arm64-cpu-low-perf-${{ steps.cpu.outputs.fingerprint }}
           evict-old-files: 1d
 
       - name: Dependencies
@@ -1364,10 +1381,17 @@ jobs:
         id: checkout
         uses: actions/checkout@v4
 
+      - name: CPU fingerprint
+        id: cpu
+        # ci/run.sh builds with -march=native, and ccache 4.5 hashes that flag
+        # literally, so key the cache on the runner's CPU features to never
+        # reuse objects built for a different CPU
+        run: echo "fingerprint=$(grep -E '^(model name|flags|CPU part|Features)' /proc/cpuinfo | sort -u | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.16
         with:
-          key: ggml-ci-x64-cpu-high-perf
+          key: ggml-ci-x64-cpu-high-perf-${{ steps.cpu.outputs.fingerprint }}
           evict-old-files: 1d
 
       - name: Dependencies
@@ -1389,10 +1413,17 @@ jobs:
         id: checkout
         uses: actions/checkout@v4
 
+      - name: CPU fingerprint
+        id: cpu
+        # ci/run.sh builds with -march=native, and ccache 4.5 hashes that flag
+        # literally, so key the cache on the runner's CPU features to never
+        # reuse objects built for a different CPU
+        run: echo "fingerprint=$(grep -E '^(model name|flags|CPU part|Features)' /proc/cpuinfo | sort -u | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.16
         with:
-          key: ggml-ci-arm64-cpu-high-perf
+          key: ggml-ci-arm64-cpu-high-perf-${{ steps.cpu.outputs.fingerprint }}
           evict-old-files: 1d
 
       - name: Dependencies
@@ -1414,10 +1445,17 @@ jobs:
         id: checkout
         uses: actions/checkout@v4
 
+      - name: CPU fingerprint
+        id: cpu
+        # ci/run.sh builds with -march=native, and ccache 4.5 hashes that flag
+        # literally, so key the cache on the runner's CPU features to never
+        # reuse objects built for a different CPU
+        run: echo "fingerprint=$(grep -E '^(model name|flags|CPU part|Features)' /proc/cpuinfo | sort -u | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.16
         with:
-          key: ggml-ci-arm64-cpu-high-perf-sve
+          key: ggml-ci-arm64-cpu-high-perf-sve-${{ steps.cpu.outputs.fingerprint }}
           evict-old-files: 1d
 
       - name: Dependencies
