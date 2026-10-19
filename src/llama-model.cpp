@@ -2060,6 +2060,7 @@ void llama_model::load_hparams(llama_model_loader & ml) {
 
                 // Optional ESN parameters with defaults
                 ml.get_key(LLM_KV_ESN_FEEDBACK_SCALING, hparams.esn_feedback_scaling, false);
+                ml.get_key(LLM_KV_ESN_FEEDBACK_TOKEN,   hparams.esn_feedback_token, false);
                 ml.get_key(LLM_KV_ESN_NOISE_LEVEL,      hparams.esn_noise_level, false);
                 ml.get_key(LLM_KV_ESN_ACTIVATION_TYPE,  hparams.esn_activation_type, false);
                 ml.get_key(LLM_KV_ESN_BIDIRECTIONAL,    hparams.esn_bidirectional, false);
@@ -2084,6 +2085,12 @@ void llama_model::load_hparams(llama_model_loader & ml) {
 
                 // Validate all ESN parameters now that they are loaded
                 hparams.validate_esn_params();
+
+                if (hparams.esn_bidirectional) {
+                    LLAMA_LOG_WARN("%s: esn.bidirectional is set, but inference runs the reservoir forward only; "
+                        "a readout trained on backward-pass states saw the next token and scores worse than "
+                        "its training metrics\n", __func__);
+                }
 
                 switch (hparams.n_layer) {
                     case 1: type = LLM_TYPE_SMALL; break;
@@ -6050,10 +6057,10 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                     // W_out.ne[1]=n_vocab.
                     output = create_tensor(tn(LLM_TENSOR_ESN_OUTPUT_WEIGHTS, "weight"), {reservoir_size, n_vocab}, 0);
 
-                    // Optional: W_fb used as ggml_mul_mat(W_fb, y_prev) where
-                    // y_prev.ne[0]=n_vocab, so W_fb.ne[0]=n_vocab,
-                    // W_fb.ne[1]=reservoir_size.
-                    layers[0].wv = create_tensor(tn(LLM_TENSOR_ESN_FEEDBACK_WEIGHTS, "weight"), {n_vocab, reservoir_size}, TENSOR_NOT_REQUIRED);
+                    // Optional: W_fb. The fed-back output is the one-hot of
+                    // the input token, so W_fb·y is a row lookup like
+                    // tok_embd: ne[0]=reservoir_size, ne[1]=n_vocab.
+                    layers[0].wv = create_tensor(tn(LLM_TENSOR_ESN_FEEDBACK_WEIGHTS, "weight"), {reservoir_size, n_vocab}, TENSOR_NOT_REQUIRED);
 
                     // Optional: bias vectors (same length as reservoir).
                     layers[0].bq = create_tensor(tn(LLM_TENSOR_ESN_INPUT_BIAS, "weight"), {reservoir_size}, TENSOR_NOT_REQUIRED);
@@ -19392,17 +19399,17 @@ struct llm_build_apertus : public llm_graph_context {
 //
 // Features:
 //   - Configurable activation (tanh / sigmoid / leaky-relu)
-//   - Optional output-to-reservoir feedback (feedback_scaling > 0, W_fb present)
+//   - Optional feedback of the emitted token (feedback_scaling > 0, W_fb present)
 //   - Optional input and reservoir bias tensors
 //   - Leaky integration via leaking_rate
 //
 // Features set at training time (via scripts/esn_training.py), not needed in
 // the inference path:
 //   - esn_noise_level: noise injection during training for regularization
-//   - esn_bidirectional: reservoir weights initialized for bidirectional
-//     processing; inference remains causal/forward-only to preserve
-//     streaming semantics
 //   - esn_spectral_radius / esn_sparsity: baked into W_res at training time
+//
+// esn_bidirectional is not supported: inference is causal, and a readout
+// trained on backward-pass states has seen the token it predicts.
 struct llm_build_esn : public llm_graph_context_mamba {
     // Helper function to apply activation based on type
     ggml_tensor * apply_esn_activation(ggml_tensor * x, uint32_t activation_type) {
@@ -19452,6 +19459,19 @@ struct llm_build_esn : public llm_graph_context_mamba {
         if (model.layers[0].bq) {
             u = ggml_add(ctx0, u, model.layers[0].bq);
         }
+
+        // Output feedback W_fb·y(t-1). y(t-1) is the one-hot of the token
+        // emitted at t-1, i.e. this step's input token: the sampled token in
+        // generation and the true one in training (teacher forcing), so
+        // scripts/esn_training.py runs the same recurrence. Being a row lookup
+        // that does not depend on the state, it is added to the input drive
+        // for all timesteps at once.
+        if (model.layers[0].wv && feedback_scaling > 0.0f) {
+            GGML_ASSERT(res->t_tokens != nullptr && "ESN output feedback needs token inputs, not embeddings");
+            // {reservoir_size, n_vocab} rows -> {reservoir_size, n_tokens}
+            ggml_tensor * fb = ggml_get_rows(ctx0, model.layers[0].wv, res->t_tokens);
+            u = ggml_add(ctx0, u, ggml_scale(ctx0, fb, feedback_scaling));
+        }
         cb(u, "esn_input_proj", -1);
 
         // u is laid out as [reservoir_size, n_seq_tokens * n_seqs]. Reshape
@@ -19486,24 +19506,8 @@ struct llm_build_esn : public llm_graph_context_mamba {
             //            -> [reservoir_size, n_seqs]
             ggml_tensor * rec = ggml_mul_mat(ctx0, model.layers[0].wk, state);
 
-            // Pre-activation = W_res·x + W_in·u (+ feedback + bias)
+            // Pre-activation = W_res·x + W_in·u + W_fb·y (+ bias)
             ggml_tensor * pre = ggml_add(ctx0, rec, u_t);
-
-            // Optional output-to-reservoir feedback. We approximate y(t-1)
-            // by projecting the current state (= the state BEFORE this
-            // step's update) through W_out, then back through W_fb — this
-            // is the standard "projection surrogate" trick that avoids
-            // needing a cached y state in the recurrent memory.
-            if (model.layers[0].wv && feedback_scaling > 0.0f) {
-                // W_out · x : [reservoir_size, n_vocab] * [reservoir_size, n_seqs]
-                //         -> [n_vocab, n_seqs]
-                ggml_tensor * y_prev = ggml_mul_mat(ctx0, model.output, state);
-                // W_fb · y : [n_vocab, reservoir_size] * [n_vocab, n_seqs]
-                //        -> [reservoir_size, n_seqs]
-                ggml_tensor * fb = ggml_mul_mat(ctx0, model.layers[0].wv, y_prev);
-                fb = ggml_scale(ctx0, fb, feedback_scaling);
-                pre = ggml_add(ctx0, pre, fb);
-            }
 
             if (model.layers[0].bk) {
                 pre = ggml_add(ctx0, pre, model.layers[0].bk);

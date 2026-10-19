@@ -74,7 +74,7 @@ int main() {
         // Optional tensor infos
         const llm_tensor_info & fb_info  = llm_tensor_info_for(LLM_TENSOR_ESN_FEEDBACK_WEIGHTS);
         assert(fb_info.layer == LLM_TENSOR_LAYER_INPUT);
-        assert(fb_info.op == GGML_OP_MUL_MAT);
+        assert(fb_info.op == GGML_OP_GET_ROWS);  // row per fed-back token
         const llm_tensor_info & ib_info  = llm_tensor_info_for(LLM_TENSOR_ESN_INPUT_BIAS);
         assert(ib_info.layer == LLM_TENSOR_LAYER_INPUT);
         assert(ib_info.op == GGML_OP_ADD);
@@ -445,7 +445,22 @@ int main() {
         std::cout << "PASSED\n";
     }
 
-    std::cout << "\nAll " << 23 << " ESN tests passed successfully!\n";
+    // ------------------------------------------------------------------ //
+    // Test 24: feedback requires the esn.feedback_token definition
+    // ------------------------------------------------------------------ //
+    {
+        std::cout << "Test 24: validate_esn_params() – feedback without feedback_token rejected... ";
+        llama_hparams h = make_valid_esn_hparams();
+        h.esn_feedback_scaling = 0.5f;
+        bool threw = false;
+        try { h.validate_esn_params(); } catch (const std::invalid_argument &) { threw = true; }
+        assert(threw);
+        h.esn_feedback_token = true;
+        h.validate_esn_params();
+        std::cout << "PASSED\n";
+    }
+
+    std::cout << "\nAll " << 24 << " ESN tests passed successfully!\n";
 
     // Summary of ESN architecture capabilities
     std::cout << "\nESN Architecture Features:\n";

@@ -13,7 +13,6 @@ Features:
 - Multiple activation functions (tanh, sigmoid, leaky_relu)
 - Output feedback connections for generative tasks
 - Bias vectors for input and reservoir
-- Bidirectional reservoir processing
 - Ridge regression training with regularization
 
 Usage:
@@ -211,10 +210,15 @@ class ESN:
     - Multiple activation functions
     - Output feedback connections
     - Bias vectors
-    - Bidirectional processing
     """
 
     def __init__(self, config: ESNConfig):
+        if config.bidirectional:
+            # At position t a backward pass has already read token t+1, the
+            # readout's target, while llm_build_esn runs forward only.
+            raise ValueError(
+                "bidirectional reservoirs are not supported: the readout predicts "
+                "the next token, which backward-pass states have already seen")
         self.config = config
         self.rng = np.random.default_rng(config.seed)
         self.activation_fn = get_activation_fn(config.activation_type)
@@ -224,7 +228,7 @@ class ESN:
         self.W_in: np.ndarray = np.empty((0, 0), dtype=np.float32)      # Input weights
         self.W_res: np.ndarray = np.empty((0, 0), dtype=np.float32)     # Reservoir weights
         self.W_out: np.ndarray = np.empty((0, 0), dtype=np.float32)     # Output weights (trained)
-        self.W_fb: Optional[np.ndarray] = None    # Feedback weights (optional)
+        self.W_fb: Optional[np.ndarray] = None    # Feedback weights [vocab, reservoir] (optional)
         self.b_in: Optional[np.ndarray] = None    # Input bias (optional)
         self.b_res: Optional[np.ndarray] = None   # Reservoir bias (optional)
         self.tok_embd: np.ndarray = np.empty((0, 0), dtype=np.float32)  # Token embeddings
@@ -243,7 +247,6 @@ class ESN:
         logger.info(f"Initializing ESN with reservoir size {self.config.reservoir_size}")
         logger.info(f"  Activation: {['tanh', 'sigmoid', 'leaky_relu'][self.config.activation_type]}")
         logger.info(f"  Feedback scaling: {self.config.feedback_scaling}")
-        logger.info(f"  Bidirectional: {self.config.bidirectional}")
         logger.info(f"  Use bias: {self.config.use_bias}")
 
         # Token embeddings (random initialization, to be learned or loaded)
@@ -273,11 +276,13 @@ class ESN:
             (self.config.vocab_size, self.config.reservoir_size)
         ).astype(np.float32) * 0.02
 
-        # Optional: feedback weights
+        # Optional: feedback weights, one row per token since the fed-back
+        # output is a one-hot (see _input_drive). Unscaled, like W_in:
+        # feedback_scaling is applied once, in the forward pass.
         if self.config.feedback_scaling > 0:
             self.W_fb = self.rng.standard_normal(
-                (self.config.reservoir_size, self.config.vocab_size)
-            ).astype(np.float32) * self.config.feedback_scaling
+                (self.config.vocab_size, self.config.reservoir_size)
+            ).astype(np.float32)
             logger.info("  Initialized feedback weights")
 
         # Optional: bias vectors
@@ -324,11 +329,41 @@ class ESN:
                     f"(unscaled radius {radius:.4f}, {method})")
         logger.info(f"  Reservoir sparsity: {1 - np.count_nonzero(self.W_res) / self.W_res.size:.2%} zeros")
 
+    def _input_drive(self, embeddings: np.ndarray, tokens: Optional[np.ndarray]) -> np.ndarray:
+        """
+        The part of the reservoir pre-activation that does not depend on the
+        state: s·W_in·u(t) + b_in + b_res, plus the output feedback.
+
+        The fed-back output y(t-1) is the one-hot of the token emitted at
+        t-1, which is the input token at t: the true next token in training
+        (teacher forcing) and the sampled token in generation. W_fb·y(t-1)
+        is therefore the row W_fb[token_t], and training and llm_build_esn
+        run the same recurrence. (Feeding back the readout's own prediction
+        would make the states depend on W_out, which is fit to those states.)
+
+        Args:
+            embeddings: Input embeddings [..., embedding_dim]
+            tokens: Token IDs of the inputs [...]; required with feedback
+
+        Returns:
+            drive: [..., reservoir_size]
+        """
+        drive = (embeddings @ self.W_in.T) * self.config.input_scaling
+        if self.b_in is not None:
+            drive += self.b_in
+        if self.b_res is not None:
+            drive += self.b_res
+        if self.W_fb is not None:
+            if tokens is None:
+                raise ValueError("output feedback is enabled: pass the input token IDs")
+            drive += self.config.feedback_scaling * self.W_fb[tokens]
+        return drive
+
     def forward(
         self,
         embeddings: np.ndarray,
         state: Optional[np.ndarray] = None,
-        prev_output: Optional[np.ndarray] = None
+        tokens: Optional[np.ndarray] = None,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
         ESN forward pass.
@@ -336,7 +371,8 @@ class ESN:
         Args:
             embeddings: Input embeddings [n_tokens, embedding_dim]
             state: Previous reservoir state [reservoir_size] or None
-            prev_output: Previous output for feedback [vocab_size] or None
+            tokens: Token IDs of the inputs [n_tokens]; required when output
+                feedback is enabled (see _input_drive)
 
         Returns:
             states: Reservoir states for all timesteps [n_tokens, reservoir_size]
@@ -348,29 +384,14 @@ class ESN:
         n_tokens = embeddings.shape[0]
         alpha = self.config.leaking_rate
 
-        if state is None:
-            state = np.zeros(self.config.reservoir_size, dtype=np.float32)
+        x = np.zeros(self.config.reservoir_size, dtype=np.float32) if state is None else state
 
+        drive = self._input_drive(embeddings, tokens)
         states = np.zeros((n_tokens, self.config.reservoir_size), dtype=np.float32)
 
         for t in range(n_tokens):
-            # Project input to reservoir space
-            input_proj = (self.W_in @ embeddings[t]) * self.config.input_scaling
-
-            # Add input bias if present
-            if self.b_in is not None:
-                input_proj += self.b_in
-
             # Reservoir recurrence
-            reservoir_input = self.W_res @ state + input_proj
-
-            # Add feedback if enabled
-            if self.W_fb is not None and prev_output is not None:
-                reservoir_input += self.W_fb @ prev_output
-
-            # Add reservoir bias if present
-            if self.b_res is not None:
-                reservoir_input += self.b_res
+            reservoir_input = self.W_res @ x + drive[t]
 
             # Add noise if specified
             if self.config.noise_level > 0:
@@ -382,45 +403,13 @@ class ESN:
             activated = self.activation_fn(reservoir_input)
 
             # Leaky integration: x(t+1) = (1-α)*x(t) + α*f(...)
-            state = (1 - alpha) * state + alpha * activated
+            x = (1 - alpha) * x + alpha * activated
 
-            states[t] = state
+            states[t] = x
 
-            # Update prev_output for next iteration (if using feedback)
-            if self.W_fb is not None:
-                # Simple softmax to get output distribution
-                logits = self.W_out @ state
-                prev_output = np.exp(logits - np.max(logits))
-                prev_output /= prev_output.sum()
+        return states, x
 
-        return states, state
-
-    def forward_bidirectional(
-        self,
-        embeddings: np.ndarray,
-    ) -> np.ndarray:
-        """
-        Bidirectional ESN forward pass.
-
-        Processes sequence in both directions and concatenates states.
-
-        Args:
-            embeddings: Input embeddings [n_tokens, embedding_dim]
-
-        Returns:
-            states: Combined bidirectional states [n_tokens, 2*reservoir_size]
-        """
-        # Forward pass
-        states_fwd, _ = self.forward(embeddings)
-
-        # Backward pass
-        states_bwd, _ = self.forward(embeddings[::-1])
-        states_bwd = states_bwd[::-1]  # Reverse to align with forward
-
-        # Concatenate
-        return np.concatenate([states_fwd, states_bwd], axis=1)
-
-    def forward_batch(self, embeddings: np.ndarray) -> np.ndarray:
+    def forward_batch(self, embeddings: np.ndarray, tokens: Optional[np.ndarray] = None) -> np.ndarray:
         """
         Forward pass over a batch of equal-length sequences, from a zero state.
 
@@ -432,6 +421,8 @@ class ESN:
 
         Args:
             embeddings: Input embeddings [batch, n_tokens, embedding_dim]
+            tokens: Token IDs of the inputs [batch, n_tokens]; required when
+                output feedback is enabled
 
         Returns:
             states: Reservoir states [batch, n_tokens, reservoir_size]
@@ -444,53 +435,34 @@ class ESN:
         alpha = self.config.leaking_rate
 
         # The input drive does not depend on the state: one product for all steps.
-        drive = (embeddings @ self.W_in.T) * self.config.input_scaling
-        if self.b_in is not None:
-            drive += self.b_in
-        if self.b_res is not None:
-            drive += self.b_res
+        drive = self._input_drive(embeddings, tokens)
 
         state = np.zeros((batch, size), dtype=np.float32)
         states = np.empty((batch, n_tokens, size), dtype=np.float32)
-        prev_output = None
         for t in range(n_tokens):
             pre = state @ self.W_res.T
             pre += drive[:, t]
-            if self.W_fb is not None and prev_output is not None:
-                pre += prev_output @ self.W_fb.T
             if self.config.noise_level > 0:
                 pre += (self.rng.standard_normal((batch, size)).astype(np.float32)
                         * self.config.noise_level)
             state = (1 - alpha) * state + alpha * self.activation_fn(pre)
             states[:, t] = state
-            if self.W_fb is not None:
-                logits = state @ self.W_out.T
-                prev_output = np.exp(logits - logits.max(axis=1, keepdims=True))
-                prev_output /= prev_output.sum(axis=1, keepdims=True)
 
         return states
 
     def _state_batches(self, token_sequences: np.ndarray):
-        """Yield (start, states [batch, seq_length, state_dim]) over token_sequences."""
+        """Yield (start, states [batch, seq_length, reservoir_size]) over token_sequences."""
         n_tokens = token_sequences.shape[1]
-        state_dim = self.config.reservoir_size * (2 if self.config.bidirectional else 1)
-        batch = max(1, _STATE_BATCH_FLOATS // (n_tokens * state_dim))
+        batch = max(1, _STATE_BATCH_FLOATS // (n_tokens * self.config.reservoir_size))
         embd = self.tok_embd.T  # [vocab_size, embedding_dim]
         for start in range(0, len(token_sequences), batch):
-            emb = embd[token_sequences[start:start + batch]]
-            if self.config.bidirectional:
-                fwd = self.forward_batch(emb)
-                bwd = self.forward_batch(emb[:, ::-1])[:, ::-1]
-                yield start, np.concatenate([fwd, bwd], axis=2)
-            else:
-                yield start, self.forward_batch(emb)
+            tokens = token_sequences[start:start + batch]
+            yield start, self.forward_batch(embd[tokens], tokens)
 
     def _readout_features(self, states: np.ndarray) -> np.ndarray:
-        """Map states [n, state_dim] to the RMS-normalized vectors W_out reads,
-        matching llm_build_esn's output_norm."""
+        """Map states [n, reservoir_size] to the RMS-normalized vectors W_out
+        reads, matching llm_build_esn's output_norm."""
         X = states / np.sqrt(np.mean(states ** 2, axis=-1, keepdims=True) + 1e-6)
-        if self.config.bidirectional:
-            X = X[:, :self.config.reservoir_size] + X[:, self.config.reservoir_size:]
         X *= self.output_norm
         return X
 
@@ -576,12 +548,6 @@ class ESN:
             raise ValueError(
                 f"washout ({washout}) must be smaller than the sequence length "
                 f"({token_sequences.shape[1]}), or no states are left to train on")
-
-        if calibrate and self.W_fb is not None:
-            # llm_build_esn feeds W_out·x back into the reservoir, so scaling
-            # W_out would also change the recurrence it was trained on.
-            logger.info("Skipping readout calibration: with feedback enabled, W_out also drives the reservoir")
-            calibrate = False
 
         n_seq = len(token_sequences)
         n_val = 0
@@ -789,17 +755,13 @@ class ESN:
             self.init_rls()
 
         embeddings = self.tok_embd[:, token_sequence].T  # [T, E]
+        drive = self._input_drive(embeddings, token_sequence)
         state = np.zeros(self.config.reservoir_size, dtype=np.float32)
         losses = []
 
-        for t, (emb, tgt) in enumerate(zip(embeddings, target_sequence)):
+        for t, tgt in enumerate(target_sequence):
             # Update reservoir state
-            input_proj = (self.W_in @ emb) * self.config.input_scaling
-            if self.b_in is not None:
-                input_proj += self.b_in
-            res_in = self.W_res @ state + input_proj
-            if self.b_res is not None:
-                res_in += self.b_res
+            res_in = self.W_res @ state + drive[t]
             activated = self.activation_fn(res_in)
             state = (1 - self.config.leaking_rate) * state + self.config.leaking_rate * activated
 
@@ -835,9 +797,10 @@ class ESN:
           - ``esn.leaking_rate``     (float32, required)
           - ``esn.input_scaling``    (float32, required)
           - ``esn.feedback_scaling`` (float32, optional)
+          - ``esn.feedback_token``   (bool, with feedback: fed-back output is the input token)
           - ``esn.noise_level``      (float32, optional)
           - ``esn.activation_type``  (uint32, optional: 0=tanh, 1=sigmoid, 2=leaky_relu)
-          - ``esn.bidirectional``    (bool, optional)
+          - ``esn.bidirectional``    (bool, optional; always false)
           - ``esn.attention.layernorm_rms_eps`` (float32, required by loader)
 
         Tensors emitted (``.weight`` suffix per llama.cpp convention):
@@ -846,7 +809,7 @@ class ESN:
           - ``esn_reservoir_weights.weight`` [reservoir_size, reservoir_size]
           - ``output_norm.weight``         [reservoir_size]
           - ``esn_output_weights.weight``  [reservoir_size, n_vocab]
-          - ``esn_feedback_weights.weight``  (optional)
+          - ``esn_feedback_weights.weight``  [reservoir_size, n_vocab] (optional)
           - ``esn_input_bias.weight``        (optional)
           - ``esn_reservoir_bias.weight``    (optional)
         """
@@ -892,6 +855,10 @@ class ESN:
         writer.add_float32("esn.leaking_rate",     self.config.leaking_rate)
         writer.add_float32("esn.input_scaling",    self.config.input_scaling)
         writer.add_float32("esn.feedback_scaling", self.config.feedback_scaling)
+        if self.W_fb is not None:
+            # Marks the feedback definition of _input_drive; llama.cpp refuses
+            # feedback models without it, whose training did not match inference.
+            writer.add_bool("esn.feedback_token", True)
         writer.add_float32("esn.noise_level",      self.config.noise_level)
         writer.add_uint32("esn.activation_type",   self.config.activation_type)
         writer.add_bool("esn.bidirectional",       self.config.bidirectional)
@@ -923,8 +890,8 @@ class ESN:
         #   output_norm.weight           C++ {reservoir}                  [1-D]
         #   esn_output_weights.weight    C++ {reservoir, n_vocab}
         #       -> numpy (n_vocab, reservoir)     [matches training layout]
-        #   esn_feedback_weights.weight  C++ {n_vocab, reservoir}
-        #       -> numpy (reservoir, n_vocab)     [matches training layout]
+        #   esn_feedback_weights.weight  C++ {reservoir, n_vocab}
+        #       -> numpy (n_vocab, reservoir)     [matches training layout]
         #   esn_input_bias.weight        C++ {reservoir}                  [1-D]
         #   esn_reservoir_bias.weight    C++ {reservoir}                  [1-D]
         def _f32(x: np.ndarray) -> np.ndarray:
@@ -1098,9 +1065,6 @@ Examples:
   # Generative ESN with feedback
   python esn_training.py --reservoir-size 1024 --feedback-scaling 0.5
 
-  # Bidirectional ESN
-  python esn_training.py --reservoir-size 512 --bidirectional
-
   # Online RLS training (infer-train / ESLLM)
   python esn_training.py --reservoir-size 1024 --online --online-mode rls \\
       --forgetting-factor 0.999 --output online_model.gguf
@@ -1137,7 +1101,8 @@ Examples:
     parser.add_argument("--noise-level", type=float, default=0.0,
                         help="Noise injection level for regularization")
     parser.add_argument("--bidirectional", action="store_true",
-                        help="Use bidirectional reservoir processing")
+                        help="Not supported: backward-pass states have seen the "
+                             "next token the readout predicts")
     parser.add_argument("--use-bias", action="store_true",
                         help="Use bias vectors for input and reservoir")
 
@@ -1191,6 +1156,10 @@ Examples:
 
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(message)s")
+    if args.bidirectional:
+        parser.error("--bidirectional is not supported: at position t the backward "
+                     "pass has already read token t+1, the readout's target, and "
+                     "inference runs forward only")
 
     # Map activation name to type
     activation_map = {

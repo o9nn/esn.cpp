@@ -33,14 +33,19 @@ Where:
 - `y(t)` is the output projection at time t
 - `W_res` is the reservoir weight matrix (with spectral radius < 1)
 - `W_in` is the input weight matrix
-- `W_fb` is the optional output-to-reservoir feedback matrix
+- `W_fb` is the optional output-to-reservoir feedback matrix, applied to
+  `y(t-1)`, the one-hot of the token emitted at t-1
 - `W_out` is the trained output readout matrix
 - `b` are the optional input/reservoir bias vectors
 - `f` is the activation function (tanh, sigmoid, or leaky-relu)
 - `α` is the leaking rate (controls memory vs. adaptation trade-off)
 
 The feedback term `W_fb * y(t-1)` is only included when `esn_feedback_scaling > 0`
-and the `esn_feedback_weights` tensor is present in the GGUF file.
+and the `esn_feedback_weights` tensor is present in the GGUF file. The token
+emitted at t-1 is the input token at t: the sampled token in generation and
+the true next token in training (teacher forcing). So `W_fb * y(t-1)` is the
+row of `W_fb` for the input token, scaled by `esn_feedback_scaling`, and
+training and inference run the same recurrence.
 
 ### Model Components
 
@@ -56,7 +61,7 @@ and the `esn_feedback_weights` tensor is present in the GGUF file.
 | `esn_feedback_scaling` | Output-to-reservoir feedback (0 = disabled) | 0.0 | >= 0 |
 | `esn_noise_level` | Noise injection for regularization | 0.0 | >= 0 |
 | `esn_activation_type` | Activation function (0=tanh, 1=sigmoid, 2=leaky_relu) | 0 | {0,1,2} |
-| `esn_bidirectional` | Enable bidirectional processing | false | bool |
+| `esn_bidirectional` | Not supported (inference is forward-only; see limitations) | false | bool |
 
 #### Tensors
 
@@ -65,7 +70,7 @@ and the `esn_feedback_weights` tensor is present in the GGUF file.
 | `esn_input_weights` | `[reservoir_size, n_embd]` | Maps input embeddings to reservoir |
 | `esn_reservoir_weights` | `[reservoir_size, reservoir_size]` | Recurrent reservoir connections |
 | `esn_output_weights` | `[n_vocab, reservoir_size]` | Maps reservoir to output vocabulary |
-| `esn_feedback_weights` | `[reservoir_size, n_vocab]` | Output-to-reservoir feedback (optional) |
+| `esn_feedback_weights` | `[n_vocab, reservoir_size]` | Output-to-reservoir feedback, one row per token (optional) |
 | `esn_input_bias` | `[reservoir_size]` | Input projection bias (optional) |
 | `esn_reservoir_bias` | `[reservoir_size]` | Reservoir activation bias (optional) |
 
@@ -86,12 +91,13 @@ The ESN forward pass (`llm_build_esn` in `src/llama-model.cpp`) consists of:
 
 1. **Input Projection**: `W_in * input_embeddings`, scaled by `esn_input_scaling`,
    plus optional `esn_input_bias`
-2. **State Retrieval**: Get previous reservoir state via
+2. **Optional Feedback**: when `esn_feedback_scaling > 0` and
+   `esn_feedback_weights` is loaded, add `esn_feedback_scaling` times the
+   `W_fb` row of each input token (a `get_rows`, done for the whole batch
+   before the recurrence because it does not depend on the state)
+3. **State Retrieval**: Get previous reservoir state via
    `llama_memory_recurrent_context::get_s_l(0)` and `build_rs()`
-3. **Recurrent Projection**: `W_res * x(t)`
-4. **Optional Feedback**: When `esn_feedback_scaling > 0` and
-   `esn_feedback_weights` is loaded, add
-   `esn_feedback_scaling * W_fb * (W_out * x(t))` to the pre-activation
+4. **Recurrent Projection**: `W_res * x(t)`
 5. **Optional Reservoir Bias**: Add `esn_reservoir_bias`
 6. **Activation**: Apply the selected activation (`esn_activation_type`:
    tanh, sigmoid, or leaky ReLU with slope 0.01, matching the training script)
@@ -109,9 +115,9 @@ Notes on features that live outside the inference path:
 - **`esn_noise_level`**: injected into the reservoir update during Python
   training (`scripts/esn_training.py`) for regularization; omitted from the
   deterministic inference graph
-- **`esn_bidirectional`**: affects how `W_res` is initialized at training
-  time; inference remains strictly causal/forward to preserve streaming
-  semantics
+- **`esn_bidirectional`**: not supported. Inference is causal, and the
+  training script rejects `--bidirectional`; the loader warns when a GGUF
+  sets it
 - **`esn_spectral_radius`, `esn_sparsity`**: baked into the reservoir
   weight matrix at training time; the inference graph does not need to see
   them beyond metadata
@@ -242,15 +248,21 @@ ESNs exhibit favorable scaling properties:
 2. **Initialization**: Reservoir weights should satisfy echo state property
 3. **Hyperparameter Sensitivity**: Performance depends critically on spectral radius
 4. **Limited Context**: No explicit attention mechanism for long-range dependencies
-5. **Output feedback**: training collects states with the softmax of the
-   initial random readout fed back through `W_fb` (which already includes
-   `esn_feedback_scaling`), while inference feeds back the trained
-   readout's raw logits and applies `esn_feedback_scaling` again, so models
-   trained with `--feedback-scaling > 0` run different dynamics at inference
-6. **Bidirectional training**: `--bidirectional` adds backward-pass states to
-   the readout features, and at position t those have already seen the
-   target token t+1; inference is forward-only, so training and validation
-   scores of such models overstate inference quality
+5. **Output feedback is the emitted token, not the readout**: `W_fb` is
+   applied to the one-hot of the token emitted at t-1, which training
+   (teacher forcing) and inference both know exactly. Feeding back the
+   readout's own prediction instead would put `W_out` inside the recurrence
+   whose states it is fit to: ridge regression has no closed form for that,
+   and refitting on states regenerated with the previous readout did not
+   converge in tests. GGUF files with feedback written before
+   `esn.feedback_token` (which fed back raw `W_out * x` logits at inference
+   and something else in training) are refused at load and need retraining.
+6. **No bidirectional reservoirs**: the readout predicts the next token, and
+   at position t a backward pass has already read it, so backward-pass
+   states would leak the target into training and validation while
+   inference runs forward only. `esn_training.py` rejects `--bidirectional`
+   and `"bidirectional": true` configs, and the loader warns on GGUF files
+   that set `esn.bidirectional`.
 
 ### Best Practices
 
@@ -331,8 +343,8 @@ extension of `_write_tokenizer()` — call `writer.add_tokenizer_model(...)`,
 - Inference-time (consumed by `llm_build_esn`): activation choice, feedback
   (when `esn_feedback_scaling > 0` and `esn_feedback_weights` are in the GGUF),
   input bias, reservoir bias, leaky integration, input scaling.
-- Training-time-only: noise injection, bidirectional reservoir
-  initialization, spectral radius scaling, sparsity masking.
+- Training-time-only: noise injection, spectral radius scaling, sparsity
+  masking.
 
 ## Testing
 
@@ -416,8 +428,7 @@ ESN training uses ridge regression on output weights only:
    probability-scale outputs, so using them directly as logits gives a
    nearly uniform softmax. A single logit scale β is fitted on the
    held-out sequences (NLL is convex in β) and folded into `W_out`. It does
-   not change the argmax. Skipped for models with output feedback, where
-   `W_out` also drives the reservoir.
+   not change the argmax.
 5. **Refit and Export**: the readout is refit on training + held-out data
    with the chosen λ and saved as GGUF for llama.cpp inference
 

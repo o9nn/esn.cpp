@@ -264,6 +264,15 @@ void llama_hparams::validate_esn_params() const {
             std::to_string(esn_feedback_scaling));
     }
 
+    // Models written before esn.feedback_token fed back W_out·x at inference
+    // and something else in training; refuse them rather than run them.
+    if (esn_feedback_scaling > 0.0f && !esn_feedback_token) {
+        throw std::invalid_argument(
+            "ESN: this model uses an output-feedback definition that its training "
+            "did not match (esn.feedback_token is not set); retrain it with "
+            "scripts/esn_training.py");
+    }
+
     // noise_level must be non-negative
     if (esn_noise_level < 0.0f) {
         throw std::invalid_argument(

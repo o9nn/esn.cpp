@@ -37,7 +37,7 @@ x(t+1) = (1-α) * x(t) + α * tanh(W_res * x(t) + W_in * u(t))
 | `esn_feedback_scaling` | 0.0 | Output-to-reservoir feedback (0 = disabled) |
 | `esn_noise_level` | 0.0 | Noise injection for regularization |
 | `esn_activation_type` | 0 | Activation: 0=tanh, 1=sigmoid, 2=leaky_relu |
-| `esn_bidirectional` | false | Bidirectional reservoir processing |
+| `esn_bidirectional` | false | Not supported (inference is forward-only) |
 
 ### Tensor Layout
 
@@ -47,7 +47,7 @@ esn_input_weights.weight      [reservoir_size, n_embd]
 esn_reservoir_weights.weight  [reservoir_size, reservoir_size]
 output_norm.weight            [reservoir_size]
 esn_output_weights.weight     [n_vocab, reservoir_size]
-esn_feedback_weights.weight   [reservoir_size, n_vocab]  (optional)
+esn_feedback_weights.weight   [n_vocab, reservoir_size]  (optional, row per fed-back token)
 esn_input_bias.weight         [reservoir_size]           (optional)
 esn_reservoir_bias.weight     [reservoir_size]           (optional)
 ```
