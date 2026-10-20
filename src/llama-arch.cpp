@@ -269,6 +269,7 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_ESN_LEAKING_RATE,      "esn.leaking_rate"      },
     { LLM_KV_ESN_INPUT_SCALING,     "esn.input_scaling"     },
     { LLM_KV_ESN_FEEDBACK_SCALING,  "esn.feedback_scaling"  },
+    { LLM_KV_ESN_FEEDBACK_TOKEN,    "esn.feedback_token"    },
     { LLM_KV_ESN_NOISE_LEVEL,       "esn.noise_level"       },
     { LLM_KV_ESN_ACTIVATION_TYPE,   "esn.activation_type"   },
     { LLM_KV_ESN_BIDIRECTIONAL,     "esn.bidirectional"     },
@@ -2472,7 +2473,7 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
     {LLM_TENSOR_ESN_INPUT_WEIGHTS,          {LLM_TENSOR_LAYER_INPUT,  GGML_OP_MUL_MAT}},
     {LLM_TENSOR_ESN_RESERVOIR_WEIGHTS,      {LLM_TENSOR_LAYER_INPUT,  GGML_OP_MUL_MAT}},
     {LLM_TENSOR_ESN_OUTPUT_WEIGHTS,         {LLM_TENSOR_LAYER_OUTPUT, GGML_OP_MUL_MAT}},
-    {LLM_TENSOR_ESN_FEEDBACK_WEIGHTS,       {LLM_TENSOR_LAYER_INPUT,  GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_ESN_FEEDBACK_WEIGHTS,       {LLM_TENSOR_LAYER_INPUT,  GGML_OP_GET_ROWS}},
     {LLM_TENSOR_ESN_INPUT_BIAS,             {LLM_TENSOR_LAYER_INPUT,  GGML_OP_ADD}},
     {LLM_TENSOR_ESN_RESERVOIR_BIAS,         {LLM_TENSOR_LAYER_INPUT,  GGML_OP_ADD}},
 };

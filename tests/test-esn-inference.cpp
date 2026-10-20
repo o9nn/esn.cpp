@@ -19,6 +19,10 @@
 //      state is not frozen).
 //   I. Softmax is well-defined: exp(logits - max) sums to a finite,
 //      strictly-positive value.
+//   J. Batch consistency: decoding a prompt in one batch with every
+//      position as an output — alone, and alongside a second sequence in
+//      the same batch — yields the same per-position logits as feeding it
+//      one token at a time.
 //
 // Invocation (from the build dir):
 //   bin/test-esn-inference <path-to-esn-model.gguf>
@@ -39,12 +43,12 @@
 
 static void silent_log(enum ggml_log_level, const char *, void *) {}
 
-static llama_context * make_ctx(llama_model * model) {
+static llama_context * make_ctx(llama_model * model, uint32_t n_seq_max = 1) {
     llama_context_params cparams = llama_context_default_params();
     cparams.n_ctx     = 64;
     cparams.n_batch   = 64;
     cparams.n_ubatch  = 64;
-    cparams.n_seq_max = 1;
+    cparams.n_seq_max = n_seq_max;
     cparams.no_perf   = true;
     return llama_init_from_model(model, cparams);
 }
@@ -91,6 +95,67 @@ static double max_abs_diff(const std::vector<float> & a, const std::vector<float
         if (d > m) m = d;
     }
     return m;
+}
+
+static double max_abs(const std::vector<float> & v) {
+    double m = 0.0;
+    for (float x : v) m = std::fmax(m, std::fabs((double) x));
+    return m;
+}
+
+// Per-position logits from feeding tokens one decode call at a time.
+static std::vector<std::vector<float>> stepwise_logits(llama_model * model, const std::vector<llama_token> & tokens,
+                                                       int32_t n_vocab) {
+    llama_context * ctx = make_ctx(model);
+    assert(ctx && "J: init stepwise context");
+    std::vector<std::vector<float>> out;
+    for (llama_token t : tokens) {
+        const bool ok = decode_step(ctx, t);
+        assert(ok && "J: stepwise decode");
+        out.push_back(snapshot_logits(ctx, n_vocab));
+    }
+    llama_free(ctx);
+    return out;
+}
+
+// Decode all sequences in one batch with every position as an output and
+// return the largest deviation from the stepwise reference, relative to the
+// reference's magnitude.
+static double batched_rel_error(llama_model * model, const std::vector<std::vector<llama_token>> & seqs,
+                                const std::vector<std::vector<std::vector<float>>> & refs, int32_t n_vocab) {
+    int32_t n_total = 0;
+    for (const auto & s : seqs) n_total += (int32_t) s.size();
+
+    llama_context * ctx = make_ctx(model, (uint32_t) seqs.size());
+    assert(ctx && "J: init batched context");
+    llama_batch batch = llama_batch_init(n_total, 0, 1);
+    for (size_t s = 0; s < seqs.size(); ++s) {
+        for (size_t t = 0; t < seqs[s].size(); ++t) {
+            const int32_t i = batch.n_tokens++;
+            batch.token[i]     = seqs[s][t];
+            batch.pos[i]       = (llama_pos) t;
+            batch.n_seq_id[i]  = 1;
+            batch.seq_id[i][0] = (llama_seq_id) s;
+            batch.logits[i]    = 1;
+        }
+    }
+    const int32_t rc = llama_decode(ctx, batch);
+    assert(rc == 0 && "J: batched decode");
+
+    double worst = 0.0;
+    int32_t i = 0;
+    for (size_t s = 0; s < seqs.size(); ++s) {
+        for (size_t t = 0; t < seqs[s].size(); ++t, ++i) {
+            const float * p = llama_get_logits_ith(ctx, i);
+            assert(p != nullptr && "J: batched logits");
+            const std::vector<float> got(p, p + n_vocab);
+            const auto & want = refs[s][t];
+            worst = std::fmax(worst, max_abs_diff(got, want) / (1.0 + max_abs(want)));
+        }
+    }
+    llama_batch_free(batch);
+    llama_free(ctx);
+    return worst;
 }
 
 int main(int argc, char ** argv) {
@@ -184,9 +249,29 @@ int main(int argc, char ** argv) {
     assert(std::isfinite(z) && z > 0.0 && "I: softmax denominator must be finite and positive");
     fprintf(stderr, "test-esn-inference: I OK (softmax Z = %.6g, lmax = %.6g)\n", z, (double) lmax);
 
+    // --- J. batch consistency ---------------------------------------------
+    // An odd, non-power-of-two length so the multi-token output stacking
+    // sees uneven splits.
+    std::vector<llama_token> seq_p, seq_q;
+    for (int t = 0; t < 23; ++t) {
+        seq_p.push_back((llama_token) ((7 * t + 3)  % n_vocab));
+        seq_q.push_back((llama_token) ((11 * t + 5) % n_vocab));
+    }
+    const auto ref_p = stepwise_logits(model, seq_p, n_vocab);
+    const auto ref_q = stepwise_logits(model, seq_q, n_vocab);
+    const double err_one = batched_rel_error(model, { seq_p }, { ref_p }, n_vocab);
+    const double err_two = batched_rel_error(model, { seq_p, seq_q }, { ref_p, ref_q }, n_vocab);
+    // Batched and stepwise decodes may take different matmul kernels, so
+    // allow rounding: ~1e-5 for an F32 reservoir, ~1e-3 for an F16 one
+    // (its product rounds the state to F16). A misplaced row is off by O(1).
+    assert(err_one < 1e-2 && "J: one-sequence batched logits must match stepwise decoding");
+    assert(err_two < 1e-2 && "J: two-sequence batched logits must match stepwise decoding");
+    fprintf(stderr, "test-esn-inference: J OK (batched vs stepwise, rel. max|Δ|: 1 seq %.3g, 2 seqs %.3g)\n",
+            err_one, err_two);
+
     llama_model_free(model);
     llama_backend_free();
 
-    fprintf(stderr, "test-esn-inference: PASSED (A..I)\n");
+    fprintf(stderr, "test-esn-inference: PASSED (A..J)\n");
     return EXIT_SUCCESS;
 }

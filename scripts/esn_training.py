@@ -13,7 +13,6 @@ Features:
 - Multiple activation functions (tanh, sigmoid, leaky_relu)
 - Output feedback connections for generative tasks
 - Bias vectors for input and reservoir
-- Bidirectional reservoir processing
 - Ridge regression training with regularization
 
 Usage:
@@ -27,6 +26,7 @@ License: MIT
 
 import argparse
 import json
+import logging
 import numpy as np
 from pathlib import Path
 from typing import Optional, Tuple, Dict, Any, Callable
@@ -42,12 +42,14 @@ if _GGUF_PY.is_dir():
     sys.path.insert(0, str(_GGUF_PY))
 
 try:
-    from gguf import GGUFWriter, GGMLQuantizationType
+    from gguf import GGUFWriter
 except ImportError as e:
     raise SystemExit(
         "The 'gguf' package is required. Install the one bundled with this\n"
         "repository by running: pip install -e gguf-py"
     ) from e
+
+logger = logging.getLogger("esn-training")
 
 # Activation type constants (must match llama-hparams.h)
 ACTIVATION_TANH = 0
@@ -96,8 +98,8 @@ class ESNConfig:
         if self.tokenizer == "byte" and self.vocab_size != 256:
             # Byte tokenizer must have vocab == 256. Auto-correct and warn
             # rather than silently producing a broken model.
-            print(f"[ESNConfig] tokenizer='byte' requires vocab_size=256; "
-                  f"overriding vocab_size {self.vocab_size} -> 256")
+            logger.warning(f"[ESNConfig] tokenizer='byte' requires vocab_size=256; "
+                           f"overriding vocab_size {self.vocab_size} -> 256")
             self.vocab_size = 256
 
     @classmethod
@@ -126,6 +128,75 @@ def get_activation_fn(activation_type: int) -> Callable:
         return np.tanh
 
 
+# Up to this size, exact np.linalg.eigvals (O(R^3)) is cheap; above it, it
+# dominates initialization (minutes at R=8192, hours at R=16384).
+_EXACT_EIGVALS_MAX_SIZE = 2048
+
+# Bound on the floats held per batch of reservoir states during training.
+_STATE_BATCH_FLOATS = 1 << 27
+
+
+def spectral_radius(W: np.ndarray, krylov_dim: int = 128, seed: int = 0) -> float:
+    """Largest eigenvalue modulus of a square matrix.
+
+    Exact for small matrices; above _EXACT_EIGVALS_MAX_SIZE uses the outermost
+    Ritz value of a `krylov_dim`-step Arnoldi factorization (within 0.2% of
+    exact at R=4096 for ESN reservoirs, at O(krylov_dim * R^2) cost).
+    """
+    n = W.shape[0]
+    if n <= _EXACT_EIGVALS_MAX_SIZE:
+        return float(np.max(np.abs(np.linalg.eigvals(W))))
+
+    m = min(krylov_dim, n)
+    rng = np.random.default_rng(seed)
+    Q = np.zeros((m + 1, n), dtype=np.float64)
+    H = np.zeros((m + 1, m), dtype=np.float64)
+    q = rng.standard_normal(n)
+    Q[0] = q / np.linalg.norm(q)
+    for j in range(m):
+        v = (W @ Q[j].astype(W.dtype)).astype(np.float64)
+        for _ in range(2):  # classical Gram-Schmidt, applied twice for stability
+            h = Q[: j + 1] @ v
+            v -= h @ Q[: j + 1]
+            H[: j + 1, j] += h
+        H[j + 1, j] = np.linalg.norm(v)
+        if H[j + 1, j] < 1e-12:  # invariant subspace found
+            m = j + 1
+            break
+        Q[j + 1] = v / H[j + 1, j]
+    return float(np.max(np.abs(np.linalg.eigvals(H[:m, :m]))))
+
+
+def softmax_nll(Z: np.ndarray, y: np.ndarray, beta: float) -> float:
+    """Mean negative log-likelihood (nats) of targets y under softmax(beta * Z)."""
+    S = beta * Z.astype(np.float64)
+    m = S.max(axis=1, keepdims=True)
+    lse = m[:, 0] + np.log(np.exp(S - m).sum(axis=1))
+    return float(np.mean(lse - S[np.arange(len(y)), y]))
+
+
+def fit_temperature(Z: np.ndarray, y: np.ndarray) -> float:
+    """Scale beta > 0 minimizing softmax_nll(Z, y, beta).
+
+    The NLL is convex in beta, hence unimodal in log(beta), so a golden-section
+    search over a wide bracket finds the global minimum.
+    """
+    lo, hi = np.log(1e-2), np.log(1e4)
+    g = (np.sqrt(5.0) - 1.0) / 2.0
+    a, b = hi - g * (hi - lo), lo + g * (hi - lo)
+    fa, fb = softmax_nll(Z, y, np.exp(a)), softmax_nll(Z, y, np.exp(b))
+    for _ in range(60):
+        if fa < fb:
+            hi, b, fb = b, a, fa
+            a = hi - g * (hi - lo)
+            fa = softmax_nll(Z, y, np.exp(a))
+        else:
+            lo, a, fa = a, b, fb
+            b = lo + g * (hi - lo)
+            fb = softmax_nll(Z, y, np.exp(b))
+    return float(np.exp((lo + hi) / 2.0))
+
+
 class ESN:
     """
     Echo State Network implementation for training.
@@ -139,43 +210,56 @@ class ESN:
     - Multiple activation functions
     - Output feedback connections
     - Bias vectors
-    - Bidirectional processing
     """
 
     def __init__(self, config: ESNConfig):
+        if config.bidirectional:
+            # At position t a backward pass has already read token t+1, the
+            # readout's target, while llm_build_esn runs forward only.
+            raise ValueError(
+                "bidirectional reservoirs are not supported: the readout predicts "
+                "the next token, which backward-pass states have already seen")
         self.config = config
         self.rng = np.random.default_rng(config.seed)
         self.activation_fn = get_activation_fn(config.activation_type)
 
-        # Initialize weights
-        self.W_in = None      # Input weights
-        self.W_res = None     # Reservoir weights
-        self.W_out = None     # Output weights (trained)
-        self.W_fb = None      # Feedback weights (optional)
-        self.b_in = None      # Input bias (optional)
-        self.b_res = None     # Reservoir bias (optional)
-        self.tok_embd = None  # Token embeddings
-        self.output_norm = None  # Output normalization
+        # Weights. initialize() sets every non-optional one; until then they
+        # are empty placeholders, so their type is a plain ndarray.
+        self.W_in: np.ndarray = np.empty((0, 0), dtype=np.float32)      # Input weights
+        self.W_res: np.ndarray = np.empty((0, 0), dtype=np.float32)     # Reservoir weights
+        self.W_out: np.ndarray = np.empty((0, 0), dtype=np.float32)     # Output weights (trained)
+        self.W_fb: Optional[np.ndarray] = None    # Feedback weights [vocab, reservoir] (optional)
+        self.b_in: Optional[np.ndarray] = None    # Input bias (optional)
+        self.b_res: Optional[np.ndarray] = None   # Reservoir bias (optional)
+        self.tok_embd: np.ndarray = np.empty((0, 0), dtype=np.float32)  # Token embeddings
+        self.output_norm: np.ndarray = np.empty(0, dtype=np.float32)    # Output normalization
+        # Ridge regression fits W_out to one-hot targets, so W_out @ x is on a
+        # probability scale; inference treats it as logits. train() fits this
+        # scale on held-out data and save_gguf() folds it into W_out.
+        self.output_temperature = 1.0
+        # dtype the reservoir matrix is stored in by save_gguf().
+        self.reservoir_dtype = np.float32
 
         self._initialized = False
 
     def initialize(self) -> None:
         """Initialize all weight matrices according to ESN principles."""
-        print(f"Initializing ESN with reservoir size {self.config.reservoir_size}")
-        print(f"  Activation: {['tanh', 'sigmoid', 'leaky_relu'][self.config.activation_type]}")
-        print(f"  Feedback scaling: {self.config.feedback_scaling}")
-        print(f"  Bidirectional: {self.config.bidirectional}")
-        print(f"  Use bias: {self.config.use_bias}")
+        logger.info(f"Initializing ESN with reservoir size {self.config.reservoir_size}")
+        logger.info(f"  Activation: {['tanh', 'sigmoid', 'leaky_relu'][self.config.activation_type]}")
+        logger.info(f"  Feedback scaling: {self.config.feedback_scaling}")
+        logger.info(f"  Use bias: {self.config.use_bias}")
 
         # Token embeddings (random initialization, to be learned or loaded)
         self.tok_embd = self.rng.standard_normal(
             (self.config.embedding_dim, self.config.vocab_size)
         ).astype(np.float32) * 0.02
 
-        # Input weights: dense random matrix scaled by input_scaling
+        # Input weights: dense random matrix. input_scaling is applied in the
+        # forward pass, as llm_build_esn does with esn.input_scaling; baking it
+        # in here as well would apply it twice at inference.
         self.W_in = self.rng.standard_normal(
             (self.config.reservoir_size, self.config.embedding_dim)
-        ).astype(np.float32) * self.config.input_scaling
+        ).astype(np.float32)
 
         # Reservoir weights: sparse random matrix with specified connectivity
         self._init_reservoir_weights()
@@ -192,12 +276,14 @@ class ESN:
             (self.config.vocab_size, self.config.reservoir_size)
         ).astype(np.float32) * 0.02
 
-        # Optional: feedback weights
+        # Optional: feedback weights, one row per token since the fed-back
+        # output is a one-hot (see _input_drive). Unscaled, like W_in:
+        # feedback_scaling is applied once, in the forward pass.
         if self.config.feedback_scaling > 0:
             self.W_fb = self.rng.standard_normal(
-                (self.config.reservoir_size, self.config.vocab_size)
-            ).astype(np.float32) * self.config.feedback_scaling
-            print(f"  Initialized feedback weights")
+                (self.config.vocab_size, self.config.reservoir_size)
+            ).astype(np.float32)
+            logger.info("  Initialized feedback weights")
 
         # Optional: bias vectors
         if self.config.use_bias:
@@ -205,10 +291,10 @@ class ESN:
             self.b_res = self.rng.standard_normal(
                 self.config.reservoir_size
             ).astype(np.float32) * 0.1
-            print(f"  Initialized bias vectors")
+            logger.info("  Initialized bias vectors")
 
         self._initialized = True
-        print("ESN initialization complete")
+        logger.info("ESN initialization complete")
 
     def _init_reservoir_weights(self) -> None:
         """
@@ -218,34 +304,66 @@ class ESN:
         size = self.config.reservoir_size
         sparsity = self.config.sparsity
 
-        # Create sparse connectivity mask
-        connectivity = self.rng.random((size, size)) < sparsity
+        # Draw in row chunks to avoid full-size float64 temporaries. Chunked
+        # draws consume the RNG stream exactly like one (size, size) draw, so
+        # a given seed yields the same reservoir as before.
+        chunk = max(1, (1 << 24) // size)
+        connectivity = np.empty((size, size), dtype=bool)
+        for r in range(0, size, chunk):
+            connectivity[r:r + chunk] = self.rng.random((min(chunk, size - r), size)) < sparsity
 
-        # Random weights for connected elements
-        weights = self.rng.standard_normal((size, size)).astype(np.float32)
-        weights *= connectivity  # Apply sparsity mask
+        weights = np.empty((size, size), dtype=np.float32)
+        for r in range(0, size, chunk):
+            weights[r:r + chunk] = self.rng.standard_normal((min(chunk, size - r), size))
+            weights[r:r + chunk] *= connectivity[r:r + chunk]
+        del connectivity
 
-        # Scale to desired spectral radius
-        eigenvalues = np.linalg.eigvals(weights)
-        current_spectral_radius = np.max(np.abs(eigenvalues))
-
-        if current_spectral_radius > 0:
-            scale = self.config.spectral_radius / current_spectral_radius
-            weights *= scale
+        radius = spectral_radius(weights)
+        if radius > 0:
+            weights *= self.config.spectral_radius / radius
 
         self.W_res = weights
 
-        # Verify spectral radius
-        eigenvalues = np.linalg.eigvals(self.W_res)
-        actual_sr = np.max(np.abs(eigenvalues))
-        print(f"  Reservoir spectral radius: {actual_sr:.4f} (target: {self.config.spectral_radius})")
-        print(f"  Reservoir sparsity: {1 - np.count_nonzero(self.W_res) / self.W_res.size:.2%} zeros")
+        method = "exact" if size <= _EXACT_EIGVALS_MAX_SIZE else "Arnoldi estimate"
+        logger.info(f"  Reservoir spectral radius: {self.config.spectral_radius} "
+                    f"(unscaled radius {radius:.4f}, {method})")
+        logger.info(f"  Reservoir sparsity: {1 - np.count_nonzero(self.W_res) / self.W_res.size:.2%} zeros")
+
+    def _input_drive(self, embeddings: np.ndarray, tokens: Optional[np.ndarray]) -> np.ndarray:
+        """
+        The part of the reservoir pre-activation that does not depend on the
+        state: s·W_in·u(t) + b_in + b_res, plus the output feedback.
+
+        The fed-back output y(t-1) is the one-hot of the token emitted at
+        t-1, which is the input token at t: the true next token in training
+        (teacher forcing) and the sampled token in generation. W_fb·y(t-1)
+        is therefore the row W_fb[token_t], and training and llm_build_esn
+        run the same recurrence. (Feeding back the readout's own prediction
+        would make the states depend on W_out, which is fit to those states.)
+
+        Args:
+            embeddings: Input embeddings [..., embedding_dim]
+            tokens: Token IDs of the inputs [...]; required with feedback
+
+        Returns:
+            drive: [..., reservoir_size]
+        """
+        drive = (embeddings @ self.W_in.T) * self.config.input_scaling
+        if self.b_in is not None:
+            drive += self.b_in
+        if self.b_res is not None:
+            drive += self.b_res
+        if self.W_fb is not None:
+            if tokens is None:
+                raise ValueError("output feedback is enabled: pass the input token IDs")
+            drive += self.config.feedback_scaling * self.W_fb[tokens]
+        return drive
 
     def forward(
         self,
         embeddings: np.ndarray,
         state: Optional[np.ndarray] = None,
-        prev_output: Optional[np.ndarray] = None
+        tokens: Optional[np.ndarray] = None,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
         ESN forward pass.
@@ -253,7 +371,8 @@ class ESN:
         Args:
             embeddings: Input embeddings [n_tokens, embedding_dim]
             state: Previous reservoir state [reservoir_size] or None
-            prev_output: Previous output for feedback [vocab_size] or None
+            tokens: Token IDs of the inputs [n_tokens]; required when output
+                feedback is enabled (see _input_drive)
 
         Returns:
             states: Reservoir states for all timesteps [n_tokens, reservoir_size]
@@ -265,29 +384,14 @@ class ESN:
         n_tokens = embeddings.shape[0]
         alpha = self.config.leaking_rate
 
-        if state is None:
-            state = np.zeros(self.config.reservoir_size, dtype=np.float32)
+        x = np.zeros(self.config.reservoir_size, dtype=np.float32) if state is None else state
 
+        drive = self._input_drive(embeddings, tokens)
         states = np.zeros((n_tokens, self.config.reservoir_size), dtype=np.float32)
 
         for t in range(n_tokens):
-            # Project input to reservoir space
-            input_proj = self.W_in @ embeddings[t]
-
-            # Add input bias if present
-            if self.b_in is not None:
-                input_proj += self.b_in
-
             # Reservoir recurrence
-            reservoir_input = self.W_res @ state + input_proj
-
-            # Add feedback if enabled
-            if self.W_fb is not None and prev_output is not None:
-                reservoir_input += self.W_fb @ prev_output
-
-            # Add reservoir bias if present
-            if self.b_res is not None:
-                reservoir_input += self.b_res
+            reservoir_input = self.W_res @ x + drive[t]
 
             # Add noise if specified
             if self.config.noise_level > 0:
@@ -299,43 +403,68 @@ class ESN:
             activated = self.activation_fn(reservoir_input)
 
             # Leaky integration: x(t+1) = (1-α)*x(t) + α*f(...)
-            state = (1 - alpha) * state + alpha * activated
+            x = (1 - alpha) * x + alpha * activated
 
-            states[t] = state
+            states[t] = x
 
-            # Update prev_output for next iteration (if using feedback)
-            if self.W_fb is not None:
-                # Simple softmax to get output distribution
-                logits = self.W_out @ state
-                prev_output = np.exp(logits - np.max(logits))
-                prev_output /= prev_output.sum()
+        return states, x
 
-        return states, state
-
-    def forward_bidirectional(
-        self,
-        embeddings: np.ndarray,
-    ) -> np.ndarray:
+    def forward_batch(self, embeddings: np.ndarray, tokens: Optional[np.ndarray] = None) -> np.ndarray:
         """
-        Bidirectional ESN forward pass.
+        Forward pass over a batch of equal-length sequences, from a zero state.
 
-        Processes sequence in both directions and concatenates states.
+        Equivalent to forward() on each sequence up to float rounding, but
+        runs one matrix-matrix product per timestep for the whole batch
+        instead of one matrix-vector product per sequence. With noise
+        enabled, noise is drawn per timestep for the whole batch, so the
+        noise values differ from forward()'s.
 
         Args:
-            embeddings: Input embeddings [n_tokens, embedding_dim]
+            embeddings: Input embeddings [batch, n_tokens, embedding_dim]
+            tokens: Token IDs of the inputs [batch, n_tokens]; required when
+                output feedback is enabled
 
         Returns:
-            states: Combined bidirectional states [n_tokens, 2*reservoir_size]
+            states: Reservoir states [batch, n_tokens, reservoir_size]
         """
-        # Forward pass
-        states_fwd, _ = self.forward(embeddings)
+        if not self._initialized:
+            raise RuntimeError("ESN not initialized. Call initialize() first.")
 
-        # Backward pass
-        states_bwd, _ = self.forward(embeddings[::-1])
-        states_bwd = states_bwd[::-1]  # Reverse to align with forward
+        batch, n_tokens, _ = embeddings.shape
+        size = self.config.reservoir_size
+        alpha = self.config.leaking_rate
 
-        # Concatenate
-        return np.concatenate([states_fwd, states_bwd], axis=1)
+        # The input drive does not depend on the state: one product for all steps.
+        drive = self._input_drive(embeddings, tokens)
+
+        state = np.zeros((batch, size), dtype=np.float32)
+        states = np.empty((batch, n_tokens, size), dtype=np.float32)
+        for t in range(n_tokens):
+            pre = state @ self.W_res.T
+            pre += drive[:, t]
+            if self.config.noise_level > 0:
+                pre += (self.rng.standard_normal((batch, size)).astype(np.float32)
+                        * self.config.noise_level)
+            state = (1 - alpha) * state + alpha * self.activation_fn(pre)
+            states[:, t] = state
+
+        return states
+
+    def _state_batches(self, token_sequences: np.ndarray):
+        """Yield (start, states [batch, seq_length, reservoir_size]) over token_sequences."""
+        n_tokens = token_sequences.shape[1]
+        batch = max(1, _STATE_BATCH_FLOATS // (n_tokens * self.config.reservoir_size))
+        embd = self.tok_embd.T  # [vocab_size, embedding_dim]
+        for start in range(0, len(token_sequences), batch):
+            tokens = token_sequences[start:start + batch]
+            yield start, self.forward_batch(embd[tokens], tokens)
+
+    def _readout_features(self, states: np.ndarray) -> np.ndarray:
+        """Map states [n, reservoir_size] to the RMS-normalized vectors W_out
+        reads, matching llm_build_esn's output_norm."""
+        X = states / np.sqrt(np.mean(states ** 2, axis=-1, keepdims=True) + 1e-6)
+        X *= self.output_norm
+        return X
 
     def collect_states(self, token_sequences: np.ndarray) -> np.ndarray:
         """
@@ -347,26 +476,49 @@ class ESN:
         Returns:
             all_states: Collected states [total_tokens, reservoir_size]
         """
-        all_states = []
+        return np.concatenate(
+            [s.reshape(-1, s.shape[-1]) for _, s in self._state_batches(token_sequences)])
 
-        for seq in token_sequences:
-            # Convert tokens to embeddings
-            embeddings = self.tok_embd[:, seq].T  # [seq_length, embedding_dim]
+    def _normal_equations(self, inputs, targets, washout, keep_rows):
+        """Accumulate X^T X and X^T Y over readout features, batch by batch,
+        without materializing X. Also returns the first keep_rows (X, y)."""
+        size, vocab = self.config.reservoir_size, self.config.vocab_size
+        XtX = np.zeros((size, size), dtype=np.float64)
+        XtY = np.zeros((size, vocab), dtype=np.float64)
+        kept_X, kept_y, n_rows = [], [], 0
+        for start, states in self._state_batches(inputs):
+            logger.info(f"  Processing sequence {start}/{len(inputs)}")
+            X = self._readout_features(states[:, washout:].reshape(-1, states.shape[-1]))
+            y = targets[start:start + len(states), washout:].reshape(-1)
+            Y = np.zeros((len(y), vocab), dtype=np.float32)
+            Y[np.arange(len(y)), y] = 1.0
+            XtX += X.T @ X
+            XtY += X.T @ Y
+            take = min(keep_rows - min(n_rows, keep_rows), len(y))
+            if take > 0:
+                kept_X.append(X[:take].copy())
+                kept_y.append(y[:take])
+            n_rows += len(y)
+        return XtX, XtY, n_rows, np.concatenate(kept_X), np.concatenate(kept_y)
 
-            # Get reservoir states
-            if self.config.bidirectional:
-                states = self.forward_bidirectional(embeddings)
-            else:
-                states, _ = self.forward(embeddings)
-            all_states.append(states)
-
-        return np.vstack(all_states)
+    @staticmethod
+    def _ridge_solve(XtX: np.ndarray, XtY: np.ndarray, lam: float) -> np.ndarray:
+        """W_out [V, R] = ((X^T X + lam I)^-1 X^T Y)^T; XtX is left unchanged."""
+        idx = np.diag_indices_from(XtX)
+        diag = XtX[idx].copy()
+        XtX[idx] += lam
+        W = np.linalg.solve(XtX, XtY)
+        XtX[idx] = diag
+        return W.T.astype(np.float32)
 
     def train(
         self,
         token_sequences: np.ndarray,
         target_sequences: np.ndarray,
-        washout: int = 100
+        washout: int = 100,
+        val_fraction: float = 0.1,
+        calibrate: bool = True,
+        reg_grid: Optional[list] = None,
     ) -> float:
         """
         Train output weights using batch ridge regression.
@@ -374,81 +526,89 @@ class ESN:
         This is the key insight of ESNs: only the output layer needs
         to be trained, and it can be done with a simple linear method.
 
+        With at least 10 sequences, the last val_fraction of them are held
+        out (after a one-sequence gap, since text windows overlap by half) to
+        choose the ridge penalty from reg_grid and to fit the output
+        temperature; the readout is then refit on train + validation data.
+
         Args:
             token_sequences: Input token IDs [n_sequences, seq_length]
             target_sequences: Target token IDs [n_sequences, seq_length]
             washout: Number of initial timesteps to discard
+            val_fraction: Fraction of sequences held out for selection
+            calibrate: Fit the logit scale on held-out data (output_temperature)
+            reg_grid: Candidate ridge penalties, chosen by held-out NLL
 
         Returns:
-            training_accuracy: Accuracy after training
+            training_accuracy: Accuracy on (a sample of) the training data
         """
         if not self._initialized:
             raise RuntimeError("ESN not initialized. Call initialize() first.")
+        if washout >= token_sequences.shape[1]:
+            raise ValueError(
+                f"washout ({washout}) must be smaller than the sequence length "
+                f"({token_sequences.shape[1]}), or no states are left to train on")
 
-        print(f"Collecting reservoir states (washout={washout})...")
+        n_seq = len(token_sequences)
+        n_val = 0
+        if (calibrate or reg_grid) and val_fraction > 0 and n_seq >= 10:
+            n_val = max(1, int(round(n_seq * val_fraction)))
+        n_train = n_seq - n_val - (1 if n_val else 0)
+        keep_rows = max(1, _STATE_BATCH_FLOATS // self.config.reservoir_size)
 
-        # Collect reservoir states and targets
-        all_states = []
-        all_targets = []
+        logger.info(f"Collecting reservoir states (washout={washout})...")
+        XtX, XtY, n_rows, X_fit, y_fit = self._normal_equations(
+            token_sequences[:n_train], target_sequences[:n_train], washout, keep_rows)
 
-        for seq_idx, (in_seq, tgt_seq) in enumerate(zip(token_sequences, target_sequences)):
-            if seq_idx % 100 == 0:
-                print(f"  Processing sequence {seq_idx}/{len(token_sequences)}")
+        lam = self.config.regularization
+        if n_val:
+            val_XtX, val_XtY, n_val_rows, X_val, y_val = self._normal_equations(
+                token_sequences[n_seq - n_val:], target_sequences[n_seq - n_val:],
+                washout, keep_rows)
+            bits = 1.0 / np.log(2.0)
 
-            # Convert tokens to embeddings
-            embeddings = self.tok_embd[:, in_seq].T
+            if reg_grid:
+                logger.info("  ridge penalty   validation NLL (bits/token, temperature-fitted)")
+                scores = []
+                for cand in reg_grid:
+                    Z = X_val @ self._ridge_solve(XtX, XtY, cand).T
+                    scores.append(softmax_nll(Z, y_val, fit_temperature(Z, y_val)) * bits)
+                    logger.info(f"  {cand:13.3g}   {scores[-1]:.4f}")
+                lam = float(reg_grid[int(np.argmin(scores))])
+                self.config.regularization = lam
+                logger.info(f"  selected ridge penalty {lam:.3g}")
 
-            # Get reservoir states
-            if self.config.bidirectional:
-                states = self.forward_bidirectional(embeddings)
-            else:
-                states, _ = self.forward(embeddings)
+            Z = X_val @ self._ridge_solve(XtX, XtY, lam).T
+            if calibrate:
+                self.output_temperature = fit_temperature(Z, y_val)
+            logger.info(f"Validation ({n_val_rows} tokens): "
+                        f"accuracy {np.mean(np.argmax(Z, axis=1) == y_val):.4f}, "
+                        f"NLL {softmax_nll(Z, y_val, 1.0) * bits:.4f} -> "
+                        f"{softmax_nll(Z, y_val, self.output_temperature) * bits:.4f} bits/token "
+                        f"at logit scale {self.output_temperature:.4g}")
 
-            # Remove washout period
-            states = states[washout:]
-            targets = tgt_seq[washout:]
+            XtX += val_XtX
+            XtY += val_XtY
+            n_rows += n_val_rows
+            del val_XtX, val_XtY
+        elif calibrate:
+            logger.info("Skipping readout calibration: need at least 10 sequences to hold out from")
 
-            all_states.append(states)
-            all_targets.extend(targets)
+        logger.info(f"Training output weights on {n_rows} samples "
+                    f"(state dim: {self.config.reservoir_size}, ridge penalty {lam:.3g})...")
+        self.W_out = self._ridge_solve(XtX, XtY, lam)
 
-        X = np.vstack(all_states)  # [n_samples, reservoir_size] or [n_samples, 2*reservoir_size]
-        y = np.array(all_targets)  # [n_samples]
-
-        state_dim = X.shape[1]
-        print(f"Training output weights on {X.shape[0]} samples (state dim: {state_dim})...")
-
-        # Apply RMS normalization to states
-        rms = np.sqrt(np.mean(X ** 2, axis=-1, keepdims=True) + 1e-6)
-        X_norm = X / rms
-
-        # For bidirectional, we need to adjust the output weights
-        if self.config.bidirectional:
-            # Combine forward and backward contributions
-            X_norm = X_norm[:, :self.config.reservoir_size] + X_norm[:, self.config.reservoir_size:]
-
-        X_norm *= self.output_norm
-
-        # Convert targets to one-hot
-        Y = np.zeros((len(y), self.config.vocab_size), dtype=np.float32)
-        for i, target in enumerate(y):
-            Y[i, target] = 1.0
-
-        # Ridge regression: W_out = Y^T * X * (X^T * X + λI)^(-1)
-        reg = self.config.regularization * np.eye(self.config.reservoir_size)
-        XtX = X_norm.T @ X_norm + reg
-        XtY = X_norm.T @ Y
-
-        # Solve linear system
-        self.W_out = np.linalg.solve(XtX, XtY).T
-
-        # Calculate training accuracy
-        predictions = X_norm @ self.W_out.T
-        pred_tokens = np.argmax(predictions, axis=-1)
-        accuracy = np.mean(pred_tokens == y)
-
-        print(f"Training complete. Accuracy: {accuracy:.4f}")
+        accuracy = float(np.mean(np.argmax(X_fit @ self.W_out.T, axis=1) == y_fit))
+        logger.info(f"Training complete. Accuracy: {accuracy:.4f}"
+                    + (f" (first {len(y_fit)} samples)" if len(y_fit) < n_rows else ""))
 
         return accuracy
+
+    def set_reservoir_dtype(self, dtype) -> None:
+        """Store W_res as dtype in the GGUF, and round it now so the readout is
+        trained on the same reservoir that inference will run."""
+        self.reservoir_dtype = np.dtype(dtype)
+        self.W_res = self.W_res.astype(self.reservoir_dtype).astype(np.float32)
 
     # ------------------------------------------------------------------
     # Online / incremental learning (Phase 3 of ESLLM roadmap)
@@ -466,7 +626,7 @@ class ESN:
         lam = max(self.config.regularization, 1e-9)
         # Inverse correlation matrix P:  P = (1/λ) I
         self._rls_P = np.eye(rsz, dtype=np.float32) * (1.0 / lam)
-        print(f"RLS initialised: reservoir_size={rsz}, λ={lam:.2e}")
+        logger.info(f"RLS initialised: reservoir_size={rsz}, λ={lam:.2e}")
 
     def rls_update(
         self,
@@ -595,17 +755,13 @@ class ESN:
             self.init_rls()
 
         embeddings = self.tok_embd[:, token_sequence].T  # [T, E]
+        drive = self._input_drive(embeddings, token_sequence)
         state = np.zeros(self.config.reservoir_size, dtype=np.float32)
         losses = []
 
-        for t, (emb, tgt) in enumerate(zip(embeddings, target_sequence)):
+        for t, tgt in enumerate(target_sequence):
             # Update reservoir state
-            input_proj = self.W_in @ emb
-            if self.b_in is not None:
-                input_proj += self.b_in
-            res_in = self.W_res @ state + input_proj
-            if self.b_res is not None:
-                res_in += self.b_res
+            res_in = self.W_res @ state + drive[t]
             activated = self.activation_fn(res_in)
             state = (1 - self.config.leaking_rate) * state + self.config.leaking_rate * activated
 
@@ -641,9 +797,10 @@ class ESN:
           - ``esn.leaking_rate``     (float32, required)
           - ``esn.input_scaling``    (float32, required)
           - ``esn.feedback_scaling`` (float32, optional)
+          - ``esn.feedback_token``   (bool, with feedback: fed-back output is the input token)
           - ``esn.noise_level``      (float32, optional)
           - ``esn.activation_type``  (uint32, optional: 0=tanh, 1=sigmoid, 2=leaky_relu)
-          - ``esn.bidirectional``    (bool, optional)
+          - ``esn.bidirectional``    (bool, optional; always false)
           - ``esn.attention.layernorm_rms_eps`` (float32, required by loader)
 
         Tensors emitted (``.weight`` suffix per llama.cpp convention):
@@ -652,19 +809,22 @@ class ESN:
           - ``esn_reservoir_weights.weight`` [reservoir_size, reservoir_size]
           - ``output_norm.weight``         [reservoir_size]
           - ``esn_output_weights.weight``  [reservoir_size, n_vocab]
-          - ``esn_feedback_weights.weight``  (optional)
+          - ``esn_feedback_weights.weight``  [reservoir_size, n_vocab] (optional)
           - ``esn_input_bias.weight``        (optional)
           - ``esn_reservoir_bias.weight``    (optional)
         """
         if not self._initialized:
             raise RuntimeError("ESN not initialized. Call initialize() first.")
 
-        print(f"Saving model to {path}")
+        logger.info(f"Saving model to {path}")
 
         writer = GGUFWriter(path=path, arch="esn")
 
         # General metadata
         writer.add_name("ESN Model")
+        # llama_ftype: W_res holds nearly all parameters, so an F16 reservoir
+        # makes the model MOSTLY_F16 (1); otherwise ALL_F32 (0).
+        writer.add_file_type(1 if self.reservoir_dtype == np.float16 else 0)
 
         # Base model dimensions — use the standard key helpers so llama.cpp's
         # auto-derived KV keys resolve correctly (they map arch -> key).
@@ -695,6 +855,10 @@ class ESN:
         writer.add_float32("esn.leaking_rate",     self.config.leaking_rate)
         writer.add_float32("esn.input_scaling",    self.config.input_scaling)
         writer.add_float32("esn.feedback_scaling", self.config.feedback_scaling)
+        if self.W_fb is not None:
+            # Marks the feedback definition of _input_drive; llama.cpp refuses
+            # feedback models without it, whose training did not match inference.
+            writer.add_bool("esn.feedback_token", True)
         writer.add_float32("esn.noise_level",      self.config.noise_level)
         writer.add_uint32("esn.activation_type",   self.config.activation_type)
         writer.add_bool("esn.bidirectional",       self.config.bidirectional)
@@ -726,18 +890,23 @@ class ESN:
         #   output_norm.weight           C++ {reservoir}                  [1-D]
         #   esn_output_weights.weight    C++ {reservoir, n_vocab}
         #       -> numpy (n_vocab, reservoir)     [matches training layout]
-        #   esn_feedback_weights.weight  C++ {n_vocab, reservoir}
-        #       -> numpy (reservoir, n_vocab)     [matches training layout]
+        #   esn_feedback_weights.weight  C++ {reservoir, n_vocab}
+        #       -> numpy (n_vocab, reservoir)     [matches training layout]
         #   esn_input_bias.weight        C++ {reservoir}                  [1-D]
         #   esn_reservoir_bias.weight    C++ {reservoir}                  [1-D]
         def _f32(x: np.ndarray) -> np.ndarray:
             return np.ascontiguousarray(x, dtype=np.float32)
 
+        # W_res is the only tensor read once per token for every token, so it
+        # may be stored as F16 (see set_reservoir_dtype). The fitted softmax
+        # temperature is folded into W_out so inference needs no extra op.
         writer.add_tensor("token_embd.weight",            _f32(self.tok_embd.T))
         writer.add_tensor("esn_input_weights.weight",     _f32(self.W_in))
-        writer.add_tensor("esn_reservoir_weights.weight", _f32(self.W_res))
+        writer.add_tensor("esn_reservoir_weights.weight",
+                          np.ascontiguousarray(self.W_res, dtype=self.reservoir_dtype))
         writer.add_tensor("output_norm.weight",           _f32(self.output_norm))
-        writer.add_tensor("esn_output_weights.weight",    _f32(self.W_out))
+        writer.add_tensor("esn_output_weights.weight",
+                          _f32(self.W_out * self.output_temperature))
 
         if self.W_fb is not None:
             writer.add_tensor("esn_feedback_weights.weight", _f32(self.W_fb))
@@ -751,7 +920,7 @@ class ESN:
         writer.write_tensors_to_file()
         writer.close()
 
-        print(f"Model saved successfully ({os.path.getsize(path) / 1e6:.1f} MB)")
+        logger.info(f"Model saved successfully ({os.path.getsize(path) / 1e6:.1f} MB)")
 
     def _write_tokenizer(self, writer: GGUFWriter) -> None:
         """Write the tokenizer section to the GGUF file.
@@ -874,7 +1043,7 @@ def load_text_training_data(
     inputs_arr  = np.stack(inputs,  axis=0)
     targets_arr = np.stack(targets, axis=0)
 
-    print(
+    logger.info(
         f"Loaded {len(inputs_arr)} windows of length {seq_length} from "
         f"{path} ({len(data)} bytes)"
     )
@@ -895,9 +1064,6 @@ Examples:
 
   # Generative ESN with feedback
   python esn_training.py --reservoir-size 1024 --feedback-scaling 0.5
-
-  # Bidirectional ESN
-  python esn_training.py --reservoir-size 512 --bidirectional
 
   # Online RLS training (infer-train / ESLLM)
   python esn_training.py --reservoir-size 1024 --online --online-mode rls \\
@@ -935,7 +1101,8 @@ Examples:
     parser.add_argument("--noise-level", type=float, default=0.0,
                         help="Noise injection level for regularization")
     parser.add_argument("--bidirectional", action="store_true",
-                        help="Use bidirectional reservoir processing")
+                        help="Not supported: backward-pass states have seen the "
+                             "next token the readout predicts")
     parser.add_argument("--use-bias", action="store_true",
                         help="Use bias vectors for input and reservoir")
 
@@ -945,6 +1112,16 @@ Examples:
                         help="Number of sequences for sample data")
     parser.add_argument("--seq-length", type=int, default=128)
     parser.add_argument("--washout", type=int, default=100)
+    parser.add_argument("--val-fraction", type=float, default=0.1,
+                        help="Fraction of sequences held out to select the "
+                             "regularization and fit the softmax temperature")
+    parser.add_argument("--reg-grid", type=str, default=None,
+                        help="Comma-separated regularization values to try "
+                             "(picked by held-out NLL); default: --regularization only")
+    parser.add_argument("--no-calibrate", action="store_true",
+                        help="Do not fit a softmax temperature (export raw ridge outputs as logits)")
+    parser.add_argument("--outtype", choices=["f32", "f16"], default="f32",
+                        help="Storage type of the reservoir matrix in the GGUF")
 
     # Tokenizer
     parser.add_argument("--tokenizer", choices=["byte", "none"], default="byte",
@@ -978,6 +1155,11 @@ Examples:
                         help="Save config to JSON file")
 
     args = parser.parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    if args.bidirectional:
+        parser.error("--bidirectional is not supported: at position t the backward "
+                     "pass has already read token t+1, the readout's target, and "
+                     "inference runs forward only")
 
     # Map activation name to type
     activation_map = {
@@ -1012,18 +1194,20 @@ Examples:
     # Save config if requested
     if args.save_config:
         config.to_json(args.save_config)
-        print(f"Config saved to {args.save_config}")
+        logger.info(f"Config saved to {args.save_config}")
 
-    print(f"ESN Configuration: {config}")
+    logger.info(f"ESN Configuration: {config}")
 
     # Create and initialize ESN
     esn = ESN(config)
     esn.initialize()
+    if args.outtype == "f16":
+        esn.set_reservoir_dtype(np.float16)
 
     if not args.init_only:
         # Load or create training data
         if args.train_data:
-            print(f"Loading training data from {args.train_data}")
+            logger.info(f"Loading training data from {args.train_data}")
             input_seqs, target_seqs = load_text_training_data(
                 args.train_data,
                 config.vocab_size,
@@ -1031,7 +1215,7 @@ Examples:
                 max_sequences=args.n_sequences,
             )
         else:
-            print("Using sample training data (for testing only)")
+            logger.info("Using sample training data (for testing only)")
             input_seqs, target_seqs = create_sample_training_data(
                 config.vocab_size, args.n_sequences, args.seq_length, config.seed
             )
@@ -1040,7 +1224,7 @@ Examples:
             # ---------------------------------------------------------- #
             # Online / incremental training (Phase 3 – ESLLM infer-train) #
             # ---------------------------------------------------------- #
-            print(f"\nOnline training mode: {args.online_mode.upper()}")
+            logger.info(f"\nOnline training mode: {args.online_mode.upper()}")
             if args.online_mode == "rls":
                 # Override regularisation for RLS initialisation
                 config.regularization = args.online_reg
@@ -1062,12 +1246,12 @@ Examples:
                 total_loss    += stats["mean_loss"] * stats["n_updates"]
                 if seq_idx % 100 == 0:
                     mean_so_far = total_loss / max(total_updates, 1)
-                    print(f"  Seq {seq_idx}/{len(input_seqs)}  "
-                          f"mean_loss={mean_so_far:.4f}  updates={total_updates}")
+                    logger.info(f"  Seq {seq_idx}/{len(input_seqs)}  "
+                                f"mean_loss={mean_so_far:.4f}  updates={total_updates}")
 
             mean_loss = total_loss / max(total_updates, 1)
-            print(f"\nOnline training complete.  "
-                  f"Total updates: {total_updates}  Mean loss: {mean_loss:.4f}")
+            logger.info(f"\nOnline training complete.  "
+                        f"Total updates: {total_updates}  Mean loss: {mean_loss:.4f}")
 
             # Embed online-learning metadata in the GGUF file if requested
             if args.save_online_metadata:
@@ -1085,17 +1269,23 @@ Examples:
                 config.freeze_reservoir     = True
                 config.replay_window        = 256
                 esn.config = config
-                print("Online learning metadata will be embedded in GGUF.")
+                logger.info("Online learning metadata will be embedded in GGUF.")
         else:
             # Batch ridge regression (original mode)
-            accuracy = esn.train(input_seqs, target_seqs, washout=args.washout)
-            print(f"Final training accuracy: {accuracy:.4f}")
+            reg_grid = None
+            if args.reg_grid:
+                reg_grid = [float(v) for v in args.reg_grid.split(",") if v.strip()]
+            accuracy = esn.train(input_seqs, target_seqs, washout=args.washout,
+                                 val_fraction=args.val_fraction,
+                                 calibrate=not args.no_calibrate,
+                                 reg_grid=reg_grid)
+            logger.info(f"Final training accuracy: {accuracy:.4f}")
 
     # Save to GGUF
     esn.save_gguf(args.output)
-    print(f"\nModel saved to {args.output}")
-    print("\nTo use with llama.cpp:")
-    print(f"  ./llama-cli -m {args.output} -p \"Your prompt here\"")
+    logger.info(f"\nModel saved to {args.output}")
+    logger.info("\nTo use with llama.cpp:")
+    logger.info(f"  ./llama-cli -m {args.output} -p \"Your prompt here\"")
 
 
 if __name__ == "__main__":

@@ -33,14 +33,19 @@ Where:
 - `y(t)` is the output projection at time t
 - `W_res` is the reservoir weight matrix (with spectral radius < 1)
 - `W_in` is the input weight matrix
-- `W_fb` is the optional output-to-reservoir feedback matrix
+- `W_fb` is the optional output-to-reservoir feedback matrix, applied to
+  `y(t-1)`, the one-hot of the token emitted at t-1
 - `W_out` is the trained output readout matrix
 - `b` are the optional input/reservoir bias vectors
 - `f` is the activation function (tanh, sigmoid, or leaky-relu)
 - `α` is the leaking rate (controls memory vs. adaptation trade-off)
 
 The feedback term `W_fb * y(t-1)` is only included when `esn_feedback_scaling > 0`
-and the `esn_feedback_weights` tensor is present in the GGUF file.
+and the `esn_feedback_weights` tensor is present in the GGUF file. The token
+emitted at t-1 is the input token at t: the sampled token in generation and
+the true next token in training (teacher forcing). So `W_fb * y(t-1)` is the
+row of `W_fb` for the input token, scaled by `esn_feedback_scaling`, and
+training and inference run the same recurrence.
 
 ### Model Components
 
@@ -56,7 +61,7 @@ and the `esn_feedback_weights` tensor is present in the GGUF file.
 | `esn_feedback_scaling` | Output-to-reservoir feedback (0 = disabled) | 0.0 | >= 0 |
 | `esn_noise_level` | Noise injection for regularization | 0.0 | >= 0 |
 | `esn_activation_type` | Activation function (0=tanh, 1=sigmoid, 2=leaky_relu) | 0 | {0,1,2} |
-| `esn_bidirectional` | Enable bidirectional processing | false | bool |
+| `esn_bidirectional` | Not supported (inference is forward-only; see limitations) | false | bool |
 
 #### Tensors
 
@@ -65,7 +70,7 @@ and the `esn_feedback_weights` tensor is present in the GGUF file.
 | `esn_input_weights` | `[reservoir_size, n_embd]` | Maps input embeddings to reservoir |
 | `esn_reservoir_weights` | `[reservoir_size, reservoir_size]` | Recurrent reservoir connections |
 | `esn_output_weights` | `[n_vocab, reservoir_size]` | Maps reservoir to output vocabulary |
-| `esn_feedback_weights` | `[reservoir_size, n_vocab]` | Output-to-reservoir feedback (optional) |
+| `esn_feedback_weights` | `[n_vocab, reservoir_size]` | Output-to-reservoir feedback, one row per token (optional) |
 | `esn_input_bias` | `[reservoir_size]` | Input projection bias (optional) |
 | `esn_reservoir_bias` | `[reservoir_size]` | Reservoir activation bias (optional) |
 
@@ -86,19 +91,23 @@ The ESN forward pass (`llm_build_esn` in `src/llama-model.cpp`) consists of:
 
 1. **Input Projection**: `W_in * input_embeddings`, scaled by `esn_input_scaling`,
    plus optional `esn_input_bias`
-2. **State Retrieval**: Get previous reservoir state via
+2. **Optional Feedback**: when `esn_feedback_scaling > 0` and
+   `esn_feedback_weights` is loaded, add `esn_feedback_scaling` times the
+   `W_fb` row of each input token (a `get_rows`, done for the whole batch
+   before the recurrence because it does not depend on the state)
+3. **State Retrieval**: Get previous reservoir state via
    `llama_memory_recurrent_context::get_s_l(0)` and `build_rs()`
-3. **Recurrent Projection**: `W_res * x(t)`
-4. **Optional Feedback**: When `esn_feedback_scaling > 0` and
-   `esn_feedback_weights` is loaded, add
-   `esn_feedback_scaling * W_fb * (W_out * x(t))` to the pre-activation
+4. **Recurrent Projection**: `W_res * x(t)`
 5. **Optional Reservoir Bias**: Add `esn_reservoir_bias`
 6. **Activation**: Apply the selected activation (`esn_activation_type`:
-   tanh, sigmoid, or gelu as a leaky-relu proxy)
-7. **Leaky Integration**: `x(t+1) = (1-α)*x(t) + α*f(...)`
+   tanh, sigmoid, or leaky ReLU with slope 0.01, matching the training script)
+7. **Leaky Integration**: `x(t+1) = (1-α)*x(t) + α*f(...)` (skipped when α = 1)
 8. **State Storage**: `ggml_cpy` new state back to `esn_states_all` at
    `kv_head * reservoir_size`
-9. **Output Normalization & Projection**: RMS norm, then
+9. **Output Stacking**: for multi-token batches, the per-token states are
+   concatenated in a balanced binary tree (O(n log n) bytes copied rather
+   than O(n²) for a left-to-right chain)
+10. **Output Normalization & Projection**: RMS norm, then
    `W_out * reservoir_state → vocabulary_logits`
 
 Notes on features that live outside the inference path:
@@ -106,9 +115,9 @@ Notes on features that live outside the inference path:
 - **`esn_noise_level`**: injected into the reservoir update during Python
   training (`scripts/esn_training.py`) for regularization; omitted from the
   deterministic inference graph
-- **`esn_bidirectional`**: affects how `W_res` is initialized at training
-  time; inference remains strictly causal/forward to preserve streaming
-  semantics
+- **`esn_bidirectional`**: not supported. Inference is causal, and the
+  training script rejects `--bidirectional`; the loader warns when a GGUF
+  sets it
 - **`esn_spectral_radius`, `esn_sparsity`**: baked into the reservoir
   weight matrix at training time; the inference graph does not need to see
   them beyond metadata
@@ -239,6 +248,21 @@ ESNs exhibit favorable scaling properties:
 2. **Initialization**: Reservoir weights should satisfy echo state property
 3. **Hyperparameter Sensitivity**: Performance depends critically on spectral radius
 4. **Limited Context**: No explicit attention mechanism for long-range dependencies
+5. **Output feedback is the emitted token, not the readout**: `W_fb` is
+   applied to the one-hot of the token emitted at t-1, which training
+   (teacher forcing) and inference both know exactly. Feeding back the
+   readout's own prediction instead would put `W_out` inside the recurrence
+   whose states it is fit to: ridge regression has no closed form for that,
+   and refitting on states regenerated with the previous readout did not
+   converge in tests. GGUF files with feedback written before
+   `esn.feedback_token` (which fed back raw `W_out * x` logits at inference
+   and something else in training) are refused at load and need retraining.
+6. **No bidirectional reservoirs**: the readout predicts the next token, and
+   at position t a backward pass has already read it, so backward-pass
+   states would leak the target into training and validation while
+   inference runs forward only. `esn_training.py` rejects `--bidirectional`
+   and `"bidirectional": true` configs, and the loader warns on GGUF files
+   that set `esn.bidirectional`.
 
 ### Best Practices
 
@@ -319,8 +343,8 @@ extension of `_write_tokenizer()` — call `writer.add_tokenizer_model(...)`,
 - Inference-time (consumed by `llm_build_esn`): activation choice, feedback
   (when `esn_feedback_scaling > 0` and `esn_feedback_weights` are in the GGUF),
   input bias, reservoir bias, leaky integration, input scaling.
-- Training-time-only: noise injection, bidirectional reservoir
-  initialization, spectral radius scaling, sparsity masking.
+- Training-time-only: noise injection, spectral radius scaling, sparsity
+  masking.
 
 ## Testing
 
@@ -382,15 +406,70 @@ python scripts/esn_training.py --init-only --reservoir-size 2048 --output untrai
 | Leaking Rate | `--leaking-rate` | 0.3 | Memory vs adaptation trade-off |
 | Regularization | `--regularization` | 1e-6 | Ridge regression lambda |
 | Washout | `--washout` | 100 | Initial timesteps to discard |
+| Validation split | `--val-fraction` | 0.1 | Sequences held out to pick lambda and fit the temperature |
+| Lambda search | `--reg-grid` | (off) | Comma-separated lambdas, chosen by held-out NLL |
+| No calibration | `--no-calibrate` | (off) | Export raw ridge outputs as logits |
+| Reservoir type | `--outtype` | `f32` | `f16` halves the reservoir's size and its per-token read |
 
 ### Training Process
 
 ESN training uses ridge regression on output weights only:
 
-1. **Initialization**: Random reservoir and input weights (fixed)
-2. **State Collection**: Run input sequences through reservoir
-3. **Ridge Regression**: `W_out = Y^T * X * (X^T * X + λI)^(-1)`
-4. **GGUF Export**: Save trained model for llama.cpp inference
+1. **Initialization**: Random reservoir and input weights (fixed). The
+   reservoir is rescaled to the target spectral radius, computed exactly up
+   to R=2048 and estimated with a 128-step Arnoldi iteration above that
+   (`np.linalg.eigvals` is O(R³) and took longer than training at R=8192).
+2. **State Collection**: Run input sequences through the reservoir in
+   batches (one matrix-matrix product per timestep for the whole batch),
+   accumulating `XᵀX` and `XᵀY` without materializing `X`
+3. **Ridge Regression**: `W_out = Y^T * X * (X^T * X + λI)^(-1)`; with
+   `--reg-grid`, the λ with the lowest held-out NLL is used
+4. **Calibration**: ridge regression to one-hot targets produces
+   probability-scale outputs, so using them directly as logits gives a
+   nearly uniform softmax. A single logit scale β is fitted on the
+   held-out sequences (NLL is convex in β) and folded into `W_out`. It does
+   not change the argmax.
+5. **Refit and Export**: the readout is refit on training + held-out data
+   with the chosen λ and saved as GGUF for llama.cpp inference
+
+With `--outtype f16`, `W_res` is rounded to F16 before state collection, so
+the readout is trained on exactly the reservoir inference runs.
+
+### Measured Effect of the Training and Inference Optimizations
+
+Byte-level models (`--tokenizer byte --embedding-dim 128 --spectral-radius
+0.9 --leaking-rate 0.3 --sparsity 0.1 --seq-length 256 --washout 32`)
+trained on ~86 kB of this repository's markdown and evaluated with
+`test-esn-perplexity` on a separate ~9.6 kB held-out file; 4-thread CPU.
+"Before" is the previous training script and graph builder.
+
+| | R=2048 before | R=2048 after | R=8192 before | R=8192 after | R=8192 after, F16 |
+|---|---:|---:|---:|---:|---:|
+| sequences / λ | 500 / 1e-2 | 500 / 1e-2 | 300 / 1e-2 | 300 / 100 (searched) | 300 / 100 |
+| training wall time | 67 s | 24 s | 510 s | 128 s | 107 s |
+| held-out bits/byte | 7.776 | 5.767 | 7.664 | 5.653 | 5.653 |
+| held-out perplexity | 219.1 | 54.4 | 202.7 | 50.3 | 50.3 |
+| held-out argmax accuracy | 28.6 % | 28.6 % | 26.0 % | 28.6 % | 28.6 % |
+| GGUF size | 20 MB | 20 MB | 281 MB | 281 MB | 147 MB |
+| prompt processing, pp512 (tok/s) | 1236 | 3571 | 162 | 247 | 443 |
+| generation, tg128 (tok/s) | 2879 | 2701 | 203 | 229 | 404 |
+
+The R=2048 throughput numbers are an A/B of the old and new graph builder
+on the same model and machine (`llama-bench -r 10`); generation is
+unchanged within noise there, since a single-token step does no output
+stacking. At R=8192 generation is bound by reading `W_res` once per token
+(256 MiB in F32), so the F16 reservoir nearly doubles it. Fixing λ at
+R=8192 matters as much as calibration: at λ=1e-2 the readout overfits
+(93.7 % training vs 24.1 % validation accuracy) and calibration alone
+reaches only 6.70 bits/byte.
+
+With the Arnoldi spectral-radius estimate, R=16384 is now practical on the
+same 4-core machine: an F16 model (λ searched over 10/100/1000) trains in
+584 s, reaches 5.635 bits/byte (perplexity 49.7, argmax 29.9 %) on the same
+held-out file, and generates at 70 tok/s from a 536 MiB GGUF. The previous
+script had not finished initializing it after 30 minutes. That this barely
+improves on R=8192 shows the ~67k-sample corpus, not the reservoir, is the
+limit at this scale.
 
 ## Related research directions (not part of this implementation)
 

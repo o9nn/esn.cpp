@@ -71,13 +71,15 @@ sign off on criteria 1–4, 6, 7 by inspection of the file set; criterion
 | Feedback path is wired | `src/llama-model.cpp` | `W_fb · y(t-1)` added when `esn_feedback_scaling != 0` |
 | Logits are produced | `src/llama-model.cpp` | `W_out · x(t)` emitted as `result_output` |
 
-**Verified by**: `bin/test-esn-inference` runs assertions A–I against the
+**Verified by**: `bin/test-esn-inference` runs assertions A–J against the
 C API: load (A), context init (B), multi-token prompt decode (C),
 single-token step (D), all-finite logits (E), **determinism — same prompt
 in a fresh context yields bit-identical logits (F)**, **prompt sensitivity
 — different prompts yield different logits (G)**, **state advancement —
-different input bytes yield different logits (H)**, and softmax well-
-definedness (I). These are numerical runtime properties, not smoke
+different input bytes yield different logits (H)**, softmax well-
+definedness (I), and **batch consistency — a multi-token batch with every
+position as an output, alone or alongside a second sequence, matches
+token-by-token decoding (J)**. These are numerical runtime properties, not smoke
 checks. Passes on two independently-trained models (R=2048 and R=1024,
 different seeds and hyperparameters).
 
@@ -117,6 +119,12 @@ trained models with different seeds, reservoir sizes, embedding dims,
 spectral radii, leaking rates, and sparsities. The forward pass is
 numerically correct, not luck.
 
+These models predate readout calibration. With the calibrated readout and
+held-out λ selection now in `scripts/esn_training.py`, held-out entropy on a
+9 602-byte held-out file is 5.77 bits/byte at R=2048 and 5.65 bits/byte at
+R=8192, at equal or better argmax accuracy; see "Measured Effect of the Training
+and Inference Optimizations" in `docs/esn.md`.
+
 ### 6. Documentation describes what's shipped
 
 | Requirement | Satisfied by | Evidence |
@@ -152,7 +160,7 @@ work. Their absence does not block this contract:
 
 - [x] Arch registry (criterion 1) — `ctest -R test-esn` 8/8
 - [x] Model loading (criterion 2) — two independently-trained GGUFs load
-- [x] Forward pass single + multi-token (criterion 3) — `test-esn-inference` PASSED (A..I, incl. determinism, prompt sensitivity, state advancement)
+- [x] Forward pass single + multi-token (criterion 3) — `test-esn-inference` PASSED (A..J, incl. determinism, prompt sensitivity, state advancement, batch consistency)
 - [x] Training produces usable models (criterion 4) — ridge acc 0.5216 (R=2048), two independently-trained models
 - [x] Beats uniform on real text (criterion 5) — 7.77 bits/byte on full held-out, confirmed on both models
 - [x] Docs cover shipped functionality (criterion 6) — `docs/esn.md`, `CLAUDE.md`, this file
