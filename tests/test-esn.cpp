@@ -60,7 +60,7 @@ int main() {
         const llm_tensor_info & input_info = llm_tensor_info_for(LLM_TENSOR_ESN_INPUT_WEIGHTS);
         assert(input_info.layer == LLM_TENSOR_LAYER_INPUT);
         assert(input_info.op == GGML_OP_MUL_MAT);
-        
+
         // ESN has exactly one reservoir layer and is addressed as layers[0],
         // so reservoir tensors are classified as non-repeating INPUT (otherwise
         // the loader asserts "repeating layer tensor used without a layer number").

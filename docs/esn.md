@@ -146,7 +146,7 @@ esn.vocab_size = <vocabulary size>
 esn.embedding_length = <input embedding dimension>
 esn.context_length = <maximum sequence length>
 
-# ESN hyperparameters  
+# ESN hyperparameters
 esn.reservoir_size = <number of reservoir neurons>
 esn.spectral_radius = <reservoir spectral radius>
 esn.sparsity = <connection sparsity>
@@ -162,7 +162,7 @@ esn.attention.layernorm_rms_eps = <RMS norm epsilon>
 ```
 # Core tensors
 token_embd.weight          # [n_embd, n_vocab]
-output_norm.weight         # [reservoir_size]  
+output_norm.weight         # [reservoir_size]
 esn_input_weights.weight   # [reservoir_size, n_embd]
 esn_reservoir_weights.weight # [reservoir_size, reservoir_size]
 esn_output_weights.weight  # [n_vocab, reservoir_size]
@@ -190,7 +190,7 @@ if (llama_model_arch(model) == LLM_ARCH_ESN) {
 
 ```cpp
 // Create context with recurrent memory
-auto ctx_params = llama_context_default_params();  
+auto ctx_params = llama_context_default_params();
 ctx_params.n_ctx = 2048;
 auto* ctx = llama_new_context_with_model(model, ctx_params);
 
@@ -227,7 +227,7 @@ float* logits = llama_get_logits_ith(ctx, batch.n_tokens - 1);
 ### Memory Usage
 
 ESN memory usage scales with:
-- Reservoir size squared (for W_res)  
+- Reservoir size squared (for W_res)
 - Reservoir × embedding dimension (for W_in)
 - Vocabulary × reservoir size (for W_out)
 - Recurrent state storage per sequence
@@ -267,7 +267,7 @@ ESNs exhibit favorable scaling properties:
 ### Best Practices
 
 1. **Spectral Radius**: Keep < 1.0 for stability, typically 0.8-0.95
-2. **Reservoir Size**: Should be 10-100x larger than input/output dimensions  
+2. **Reservoir Size**: Should be 10-100x larger than input/output dimensions
 3. **Sparsity**: 5-20% connectivity often optimal
 4. **Leaking Rate**: Use < 1.0 for better temporal processing
 
@@ -276,7 +276,7 @@ ESNs exhibit favorable scaling properties:
 ### Supported Features
 
 - ✅ Standard model loading and inference
-- ✅ Batch processing  
+- ✅ Batch processing
 - ✅ Sequence management (copy, clear, remove)
 - ✅ State serialization/deserialization
 - ✅ Multi-backend support (CPU, GPU)
@@ -288,7 +288,7 @@ ESNs exhibit favorable scaling properties:
 ESN models integrate seamlessly with:
 - **llama-server**: OpenAI-compatible API
 - **llama-cli**: Command-line interface
-- **llama-bench**: Performance benchmarking  
+- **llama-bench**: Performance benchmarking
 - **llama-quantize**: Model quantization
 - **Python bindings**: Through llama-cpp-python
 
