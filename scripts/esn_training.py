@@ -42,7 +42,7 @@ if _GGUF_PY.is_dir():
     sys.path.insert(0, str(_GGUF_PY))
 
 try:
-    from gguf import GGUFWriter
+    from gguf import GGML_QUANT_SIZES, GGMLQuantizationType, GGUFWriter, LlamaFileType, quants
 except ImportError as e:
     raise SystemExit(
         "The 'gguf' package is required. Install the one bundled with this\n"
@@ -59,6 +59,18 @@ ACTIVATION_LEAKY_RELU = 2
 
 class ESNConfig:
     """Configuration for Echo State Network."""
+
+    # Online-learning metadata, set by main() only when it is to be embedded in
+    # the GGUF. Class-level defaults keep them out of __dict__ (and so out of
+    # to_json/from_json) unless they are actually set.
+    online_learning: bool = False
+    online_lr: float = 0.0
+    online_reg: float = 0.0
+    online_buffer_size: int = 0
+    online_update_mode: int = 0
+    online_decay_rate: float = 0.0
+    freeze_reservoir: bool = False
+    replay_window: int = 0
 
     def __init__(
         self,
@@ -134,6 +146,50 @@ _EXACT_EIGVALS_MAX_SIZE = 2048
 
 # Bound on the floats held per batch of reservoir states during training.
 _STATE_BATCH_FLOATS = 1 << 27
+
+# Storage types for W_res (--outtype), with the general.file_type each gives
+# the model: W_res holds nearly all of its parameters.
+RESERVOIR_TYPES = {
+    "f32":  (GGMLQuantizationType.F32,  LlamaFileType.ALL_F32),
+    "f16":  (GGMLQuantizationType.F16,  LlamaFileType.MOSTLY_F16),
+    "q8_0": (GGMLQuantizationType.Q8_0, LlamaFileType.MOSTLY_Q8_0),
+    "q4_0": (GGMLQuantizationType.Q4_0, LlamaFileType.MOSTLY_Q4_0),
+}
+
+# Rows of W_res quantized at a time, bounding gguf-py's float temporaries.
+_QUANT_CHUNK_FLOATS = 1 << 24
+
+
+def quantize_rows(W: np.ndarray, qtype: GGMLQuantizationType) -> np.ndarray:
+    """W [rows, cols] in qtype's GGUF storage layout, chunked by rows."""
+    if qtype == GGMLQuantizationType.F32:
+        return np.ascontiguousarray(W, dtype=np.float32)
+    if qtype == GGMLQuantizationType.F16:
+        return np.ascontiguousarray(W, dtype=np.float16)
+    chunk = max(1, _QUANT_CHUNK_FLOATS // W.shape[1])
+    return np.concatenate([quants.quantize(np.ascontiguousarray(W[r:r + chunk], dtype=np.float32), qtype)
+                           for r in range(0, len(W), chunk)])
+
+
+def round_like_vec_dot(x: np.ndarray, qtype: GGMLQuantizationType) -> np.ndarray:
+    """
+    Round reservoir states x [..., R] the way ggml's CPU backend converts the
+    vector side of ggml_mul_mat(W_res, x) to W_res's vec_dot_type, so that
+    training sees the states inference computes: F16 for an F16 reservoir,
+    Q8_0 blocks for Q8_0 and Q4_0 ones (quantize_row_q8_0: q = rint(x * 127 /
+    amax), scale amax / 127 stored as F16).
+    """
+    if qtype == GGMLQuantizationType.F32:
+        return x
+    if qtype == GGMLQuantizationType.F16:
+        return x.astype(np.float16).astype(np.float32)
+    blocks = x.reshape(*x.shape[:-1], -1, 32)
+    amax = np.abs(blocks).max(axis=-1, keepdims=True)
+    with np.errstate(divide="ignore"):
+        iscale = np.where(amax > 0, np.float32(127) / amax, np.float32(0))
+    q = np.rint(blocks * iscale)
+    scale = (amax / np.float32(127)).astype(np.float16).astype(np.float32)
+    return (q * scale).reshape(x.shape)
 
 
 def spectral_radius(W: np.ndarray, krylov_dim: int = 128, seed: int = 0) -> float:
@@ -237,8 +293,8 @@ class ESN:
         # probability scale; inference treats it as logits. train() fits this
         # scale on held-out data and save_gguf() folds it into W_out.
         self.output_temperature = 1.0
-        # dtype the reservoir matrix is stored in by save_gguf().
-        self.reservoir_dtype = np.float32
+        # Type the reservoir matrix is stored in by save_gguf().
+        self.reservoir_type = "f32"
 
         self._initialized = False
 
@@ -391,7 +447,7 @@ class ESN:
 
         for t in range(n_tokens):
             # Reservoir recurrence
-            reservoir_input = self.W_res @ x + drive[t]
+            reservoir_input = self.W_res @ self._vec_dot_state(x) + drive[t]
 
             # Add noise if specified
             if self.config.noise_level > 0:
@@ -440,7 +496,7 @@ class ESN:
         state = np.zeros((batch, size), dtype=np.float32)
         states = np.empty((batch, n_tokens, size), dtype=np.float32)
         for t in range(n_tokens):
-            pre = state @ self.W_res.T
+            pre = self._vec_dot_state(state) @ self.W_res.T
             pre += drive[:, t]
             if self.config.noise_level > 0:
                 pre += (self.rng.standard_normal((batch, size)).astype(np.float32)
@@ -604,11 +660,23 @@ class ESN:
 
         return accuracy
 
-    def set_reservoir_dtype(self, dtype) -> None:
-        """Store W_res as dtype in the GGUF, and round it now so the readout is
-        trained on the same reservoir that inference will run."""
-        self.reservoir_dtype = np.dtype(dtype)
-        self.W_res = self.W_res.astype(self.reservoir_dtype).astype(np.float32)
+    def set_reservoir_type(self, name: str) -> None:
+        """
+        Store W_res as one of RESERVOIR_TYPES in the GGUF, and round it now so
+        the readout is trained on the reservoir that inference will run. From
+        then on the states fed to W_res are rounded as llama.cpp's CPU backend
+        rounds them (round_like_vec_dot).
+        """
+        qtype = RESERVOIR_TYPES[name][0]
+        block = GGML_QUANT_SIZES[qtype][0]
+        if self.config.reservoir_size % block:
+            raise ValueError(f"--outtype {name} needs a reservoir size that is a multiple of {block}")
+        self.reservoir_type = name
+        if qtype != GGMLQuantizationType.F32:
+            self.W_res = quants.dequantize(quantize_rows(self.W_res, qtype), qtype).astype(np.float32)
+
+    def _vec_dot_state(self, x: np.ndarray) -> np.ndarray:
+        return round_like_vec_dot(x, RESERVOIR_TYPES[self.reservoir_type][0])
 
     # ------------------------------------------------------------------
     # Online / incremental learning (Phase 3 of ESLLM roadmap)
@@ -761,7 +829,7 @@ class ESN:
 
         for t, tgt in enumerate(target_sequence):
             # Update reservoir state
-            res_in = self.W_res @ state + drive[t]
+            res_in = self.W_res @ self._vec_dot_state(state) + drive[t]
             activated = self.activation_fn(res_in)
             state = (1 - self.config.leaking_rate) * state + self.config.leaking_rate * activated
 
@@ -822,9 +890,7 @@ class ESN:
 
         # General metadata
         writer.add_name("ESN Model")
-        # llama_ftype: W_res holds nearly all parameters, so an F16 reservoir
-        # makes the model MOSTLY_F16 (1); otherwise ALL_F32 (0).
-        writer.add_file_type(1 if self.reservoir_dtype == np.float16 else 0)
+        writer.add_file_type(RESERVOIR_TYPES[self.reservoir_type][1])
 
         # Base model dimensions — use the standard key helpers so llama.cpp's
         # auto-derived KV keys resolve correctly (they map arch -> key).
@@ -863,7 +929,7 @@ class ESN:
         writer.add_uint32("esn.activation_type",   self.config.activation_type)
         writer.add_bool("esn.bidirectional",       self.config.bidirectional)
 
-        if getattr(self.config, "online_learning", False):
+        if self.config.online_learning:
             writer.add_bool("esn.online_learning.enabled", True)
             writer.add_float32("esn.online_learning.rate", self.config.online_lr)
             writer.add_float32("esn.online_learning.reg", self.config.online_reg)
@@ -898,12 +964,15 @@ class ESN:
             return np.ascontiguousarray(x, dtype=np.float32)
 
         # W_res is the only tensor read once per token for every token, so it
-        # may be stored as F16 (see set_reservoir_dtype). The fitted softmax
-        # temperature is folded into W_out so inference needs no extra op.
+        # may be stored as F16 or quantized (see set_reservoir_type); it was
+        # already rounded to that type, so this re-quantization is exact. The
+        # fitted softmax temperature is folded into W_out so inference needs
+        # no extra op.
+        res_qtype = RESERVOIR_TYPES[self.reservoir_type][0]
         writer.add_tensor("token_embd.weight",            _f32(self.tok_embd.T))
         writer.add_tensor("esn_input_weights.weight",     _f32(self.W_in))
-        writer.add_tensor("esn_reservoir_weights.weight",
-                          np.ascontiguousarray(self.W_res, dtype=self.reservoir_dtype))
+        writer.add_tensor("esn_reservoir_weights.weight", quantize_rows(self.W_res, res_qtype),
+                          raw_dtype=res_qtype)
         writer.add_tensor("output_norm.weight",           _f32(self.output_norm))
         writer.add_tensor("esn_output_weights.weight",
                           _f32(self.W_out * self.output_temperature))
@@ -1120,8 +1189,10 @@ Examples:
                              "(picked by held-out NLL); default: --regularization only")
     parser.add_argument("--no-calibrate", action="store_true",
                         help="Do not fit a softmax temperature (export raw ridge outputs as logits)")
-    parser.add_argument("--outtype", choices=["f32", "f16"], default="f32",
-                        help="Storage type of the reservoir matrix in the GGUF")
+    parser.add_argument("--outtype", choices=list(RESERVOIR_TYPES), default="f32",
+                        help="Storage type of the reservoir matrix in the GGUF. The readout "
+                             "is trained on the rounded reservoir; q8_0 and q4_0 need a "
+                             "reservoir size that is a multiple of 32")
 
     # Tokenizer
     parser.add_argument("--tokenizer", choices=["byte", "none"], default="byte",
@@ -1201,8 +1272,7 @@ Examples:
     # Create and initialize ESN
     esn = ESN(config)
     esn.initialize()
-    if args.outtype == "f16":
-        esn.set_reservoir_dtype(np.float16)
+    esn.set_reservoir_type(args.outtype)
 
     if not args.init_only:
         # Load or create training data
