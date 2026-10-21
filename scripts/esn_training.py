@@ -60,6 +60,18 @@ ACTIVATION_LEAKY_RELU = 2
 class ESNConfig:
     """Configuration for Echo State Network."""
 
+    # Online-learning metadata, set by main() only when it is to be embedded in
+    # the GGUF. Class-level defaults keep them out of __dict__ (and so out of
+    # to_json/from_json) unless they are actually set.
+    online_learning: bool = False
+    online_lr: float = 0.0
+    online_reg: float = 0.0
+    online_buffer_size: int = 0
+    online_update_mode: int = 0
+    online_decay_rate: float = 0.0
+    freeze_reservoir: bool = False
+    replay_window: int = 0
+
     def __init__(
         self,
         vocab_size: int = 32000,
@@ -917,7 +929,7 @@ class ESN:
         writer.add_uint32("esn.activation_type",   self.config.activation_type)
         writer.add_bool("esn.bidirectional",       self.config.bidirectional)
 
-        if getattr(self.config, "online_learning", False):
+        if self.config.online_learning:
             writer.add_bool("esn.online_learning.enabled", True)
             writer.add_float32("esn.online_learning.rate", self.config.online_lr)
             writer.add_float32("esn.online_learning.reg", self.config.online_reg)
