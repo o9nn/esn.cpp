@@ -19456,8 +19456,13 @@ struct llm_build_esn : public llm_graph_context_mamba {
         //  the create_tensor block above.)
         ggml_tensor * u = ggml_mul_mat(ctx0, model.layers[0].wq, inpL);
         u = ggml_scale(ctx0, u, hparams.esn_input_scaling);
+        // Both biases are constant over time, so they are added to the input
+        // drive once per ubatch rather than once per timestep.
         if (model.layers[0].bq) {
             u = ggml_add(ctx0, u, model.layers[0].bq);
+        }
+        if (model.layers[0].bk) {
+            u = ggml_add(ctx0, u, model.layers[0].bk);
         }
 
         // Output feedback W_fb·y(t-1). y(t-1) is the one-hot of the token
@@ -19506,12 +19511,8 @@ struct llm_build_esn : public llm_graph_context_mamba {
             //            -> [reservoir_size, n_seqs]
             ggml_tensor * rec = ggml_mul_mat(ctx0, model.layers[0].wk, state);
 
-            // Pre-activation = W_res·x + W_in·u + W_fb·y (+ bias)
+            // Pre-activation = W_res·x + (W_in·u + W_fb·y + b)
             ggml_tensor * pre = ggml_add(ctx0, rec, u_t);
-
-            if (model.layers[0].bk) {
-                pre = ggml_add(ctx0, pre, model.layers[0].bk);
-            }
 
             ggml_tensor * activated = apply_esn_activation(pre, activation_type);
 

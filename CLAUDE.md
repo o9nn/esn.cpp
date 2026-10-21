@@ -119,9 +119,10 @@ python scripts/esn_training.py --config config.json
 # Initialize only (no training)
 python scripts/esn_training.py --init-only --output untrained.gguf
 
-# Large reservoir: pick λ on held-out data, store W_res as F16
+# Large reservoir: pick λ on held-out data, store W_res as Q4_0 (f16 and
+# q8_0 also work; the readout is trained on the rounded reservoir)
 python scripts/esn_training.py --reservoir-size 8192 --reg-grid 1,10,100,1000 \
-    --outtype f16 --train-data corpus.txt --output model.gguf
+    --outtype q4_0 --train-data corpus.txt --output model.gguf
 ```
 
 Batch training holds out `--val-fraction` (default 10%) of the sequences to
