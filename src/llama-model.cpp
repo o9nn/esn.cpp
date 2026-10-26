@@ -19392,6 +19392,26 @@ struct llm_build_apertus : public llm_graph_context {
     }
 };
 
+// Timestep indices 0..n_seq_tokens-1, used by llm_build_esn to write each
+// step's reservoir state into its row of the per-token output buffer.
+class llm_graph_input_esn_steps : public llm_graph_input_i {
+public:
+    void set_input(const llama_ubatch * ubatch) override {
+        GGML_UNUSED(ubatch);
+        GGML_ASSERT(ggml_backend_buffer_is_host(steps->buffer));
+        int32_t * data = (int32_t *) steps->data;
+        for (int64_t t = 0; t < steps->ne[0]; ++t) {
+            data[t] = (int32_t) t;
+        }
+    }
+
+    bool can_reuse(const llm_graph_params & params) override {
+        return steps->ne[0] == (int64_t) params.ubatch.n_seq_tokens;
+    }
+
+    ggml_tensor * steps = nullptr; // I32 [n_seq_tokens]
+};
+
 // Echo State Network graph builder.
 //
 // Implements the ESN forward pass:
@@ -19490,12 +19510,24 @@ struct llm_build_esn : public llm_graph_context_mamba {
         //   x(t+1) = (1-α)·x(t) + α·f(W_res·x(t) + W_in·u(t) + W_fb·y(t-1) + b)
         //
         // We keep the (per-sequence) reservoir state current across the
-        // loop and collect each step's output so the final tensor has one
-        // reservoir vector per input token — matching what inp_out_ids
-        // indexes into and what the rest of llama.cpp expects for recurrent
-        // models.
-        std::vector<ggml_tensor *> per_token;
-        per_token.reserve(n_seq_tokens);
+        // loop. With more than one timestep, each step's state is also
+        // written into its row of `states`, laid out [reservoir_size,
+        // n_seq_tokens, n_seqs] so that it flattens to one reservoir vector
+        // per input token in the order inp_out_ids indexes. Every
+        // ggml_set_rows returns a view of the whole buffer that depends on
+        // the previous write, so reading the last one sees all of them, and
+        // the stacking costs one row copy per step.
+        ggml_tensor * states = nullptr;
+        ggml_tensor * steps  = nullptr;
+        if (n_seq_tokens > 1) {
+            auto inp = std::make_unique<llm_graph_input_esn_steps>();
+            inp->steps = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_seq_tokens);
+            ggml_set_input(inp->steps);
+            steps = inp->steps;
+            res->add_input(std::move(inp));
+
+            states = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, reservoir_size, n_seq_tokens, n_seqs);
+        }
 
         ggml_tensor * state = reservoir_state; // [reservoir_size, n_seqs]
         const size_t u_stride_t = reservoir_size * ggml_element_size(u);
@@ -19525,7 +19557,11 @@ struct llm_build_esn : public llm_graph_context_mamba {
                 state = ggml_add(ctx0, leaky_old, leaky_new);
             }
 
-            per_token.push_back(state);
+            if (states) {
+                states = ggml_set_rows(ctx0, states,
+                    ggml_reshape_3d(ctx0, state, reservoir_size, 1, n_seqs),
+                    ggml_view_1d(ctx0, steps, 1, t * ggml_element_size(steps)));
+            }
         }
         cb(state, "esn_reservoir_final", -1);
 
@@ -19538,37 +19574,12 @@ struct llm_build_esn : public llm_graph_context_mamba {
                 ggml_view_1d(ctx0, esn_states_all, reservoir_size * n_seqs,
                              kv_head * reservoir_size * ggml_element_size(esn_states_all))));
 
-        // Build the per-token output tensor expected by downstream layers:
-        // {reservoir_size, n_tokens}. Each column is the reservoir state at
-        // the time that token was processed. For n_seq_tokens == 1 (the
-        // common decode step) this is just the single state.
-        ggml_tensor * cur;
-        if (n_seq_tokens == 1) {
-            cur = ggml_reshape_2d(ctx0, per_token[0], reservoir_size, n_seqs);
-        } else {
-            // Stack timesteps along axis 1, then flatten (n_seq_tokens, n_seqs)
-            // down into the single n_tokens axis llama.cpp expects. Concatenate
-            // pairwise in a balanced tree: each state is copied log2(n) times,
-            // where a left-to-right chain re-copies the growing prefix at every
-            // step (O(n^2) bytes, which dominated long prompt prefill).
-            std::vector<ggml_tensor *> level;
-            level.reserve(n_seq_tokens);
-            for (ggml_tensor * s : per_token) {
-                level.push_back(ggml_reshape_3d(ctx0, s, reservoir_size, 1, n_seqs));
-            }
-            while (level.size() > 1) {
-                std::vector<ggml_tensor *> next;
-                next.reserve((level.size() + 1) / 2);
-                for (size_t i = 0; i + 1 < level.size(); i += 2) {
-                    next.push_back(ggml_concat(ctx0, level[i], level[i + 1], 1));
-                }
-                if (level.size() % 2 == 1) {
-                    next.push_back(level.back());
-                }
-                level = std::move(next);
-            }
-            cur = ggml_reshape_2d(ctx0, level[0], reservoir_size, n_tokens);
-        }
+        // The per-token output expected downstream: {reservoir_size, n_tokens},
+        // one column per input token. For the common single-token decode
+        // step this is just the state.
+        ggml_tensor * cur = states
+            ? ggml_reshape_2d(ctx0, states, reservoir_size, n_tokens)
+            : ggml_reshape_2d(ctx0, state,  reservoir_size, n_seqs);
         cb(cur, "esn_reservoir_seq", -1);
 
         if (inp_out_ids) {
