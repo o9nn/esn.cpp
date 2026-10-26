@@ -90,24 +90,24 @@ ESNs are implemented as a recurrent architecture in llama.cpp, leveraging the ex
 The ESN forward pass (`llm_build_esn` in `src/llama-model.cpp`) consists of:
 
 1. **Input Projection**: `W_in * input_embeddings`, scaled by `esn_input_scaling`,
-   plus optional `esn_input_bias`
+   plus the optional `esn_input_bias` and `esn_reservoir_bias` (both are
+   constant over time, so they are added once per batch, not per timestep)
 2. **Optional Feedback**: when `esn_feedback_scaling > 0` and
    `esn_feedback_weights` is loaded, add `esn_feedback_scaling` times the
    `W_fb` row of each input token (a `get_rows`, done for the whole batch
    before the recurrence because it does not depend on the state)
 3. **State Retrieval**: Get previous reservoir state via
    `llama_memory_recurrent_context::get_s_l(0)` and `build_rs()`
-4. **Recurrent Projection**: `W_res * x(t)`
-5. **Optional Reservoir Bias**: Add `esn_reservoir_bias`
-6. **Activation**: Apply the selected activation (`esn_activation_type`:
+4. **Recurrent Projection**: `W_res * x(t)`, added to the input drive
+5. **Activation**: Apply the selected activation (`esn_activation_type`:
    tanh, sigmoid, or leaky ReLU with slope 0.01, matching the training script)
-7. **Leaky Integration**: `x(t+1) = (1-α)*x(t) + α*f(...)` (skipped when α = 1)
-8. **State Storage**: `ggml_cpy` new state back to `esn_states_all` at
+6. **Leaky Integration**: `x(t+1) = (1-α)*x(t) + α*f(...)` (skipped when α = 1)
+7. **State Storage**: `ggml_cpy` new state back to `esn_states_all` at
    `kv_head * reservoir_size`
-9. **Output Stacking**: for multi-token batches, the per-token states are
+8. **Output Stacking**: for multi-token batches, the per-token states are
    concatenated in a balanced binary tree (O(n log n) bytes copied rather
    than O(n²) for a left-to-right chain)
-10. **Output Normalization & Projection**: RMS norm, then
+9. **Output Normalization & Projection**: RMS norm, then
    `W_out * reservoir_state → vocabulary_logits`
 
 Notes on features that live outside the inference path:
@@ -146,7 +146,7 @@ esn.vocab_size = <vocabulary size>
 esn.embedding_length = <input embedding dimension>
 esn.context_length = <maximum sequence length>
 
-# ESN hyperparameters  
+# ESN hyperparameters
 esn.reservoir_size = <number of reservoir neurons>
 esn.spectral_radius = <reservoir spectral radius>
 esn.sparsity = <connection sparsity>
@@ -162,7 +162,7 @@ esn.attention.layernorm_rms_eps = <RMS norm epsilon>
 ```
 # Core tensors
 token_embd.weight          # [n_embd, n_vocab]
-output_norm.weight         # [reservoir_size]  
+output_norm.weight         # [reservoir_size]
 esn_input_weights.weight   # [reservoir_size, n_embd]
 esn_reservoir_weights.weight # [reservoir_size, reservoir_size]
 esn_output_weights.weight  # [n_vocab, reservoir_size]
@@ -190,7 +190,7 @@ if (llama_model_arch(model) == LLM_ARCH_ESN) {
 
 ```cpp
 // Create context with recurrent memory
-auto ctx_params = llama_context_default_params();  
+auto ctx_params = llama_context_default_params();
 ctx_params.n_ctx = 2048;
 auto* ctx = llama_new_context_with_model(model, ctx_params);
 
@@ -227,7 +227,7 @@ float* logits = llama_get_logits_ith(ctx, batch.n_tokens - 1);
 ### Memory Usage
 
 ESN memory usage scales with:
-- Reservoir size squared (for W_res)  
+- Reservoir size squared (for W_res)
 - Reservoir × embedding dimension (for W_in)
 - Vocabulary × reservoir size (for W_out)
 - Recurrent state storage per sequence
@@ -267,7 +267,7 @@ ESNs exhibit favorable scaling properties:
 ### Best Practices
 
 1. **Spectral Radius**: Keep < 1.0 for stability, typically 0.8-0.95
-2. **Reservoir Size**: Should be 10-100x larger than input/output dimensions  
+2. **Reservoir Size**: Should be 10-100x larger than input/output dimensions
 3. **Sparsity**: 5-20% connectivity often optimal
 4. **Leaking Rate**: Use < 1.0 for better temporal processing
 
@@ -276,7 +276,7 @@ ESNs exhibit favorable scaling properties:
 ### Supported Features
 
 - ✅ Standard model loading and inference
-- ✅ Batch processing  
+- ✅ Batch processing
 - ✅ Sequence management (copy, clear, remove)
 - ✅ State serialization/deserialization
 - ✅ Multi-backend support (CPU, GPU)
@@ -288,7 +288,7 @@ ESNs exhibit favorable scaling properties:
 ESN models integrate seamlessly with:
 - **llama-server**: OpenAI-compatible API
 - **llama-cli**: Command-line interface
-- **llama-bench**: Performance benchmarking  
+- **llama-bench**: Performance benchmarking
 - **llama-quantize**: Model quantization
 - **Python bindings**: Through llama-cpp-python
 
@@ -409,7 +409,7 @@ python scripts/esn_training.py --init-only --reservoir-size 2048 --output untrai
 | Validation split | `--val-fraction` | 0.1 | Sequences held out to pick lambda and fit the temperature |
 | Lambda search | `--reg-grid` | (off) | Comma-separated lambdas, chosen by held-out NLL |
 | No calibration | `--no-calibrate` | (off) | Export raw ridge outputs as logits |
-| Reservoir type | `--outtype` | `f32` | `f16` halves the reservoir's size and its per-token read |
+| Reservoir type | `--outtype` | `f32` | `f16`, `q8_0` or `q4_0` (16, 8.5 or 4.5 bits per weight) shrink the reservoir and its per-token read; the quantized types need a reservoir size that is a multiple of 32 |
 
 ### Training Process
 
@@ -432,8 +432,23 @@ ESN training uses ridge regression on output weights only:
 5. **Refit and Export**: the readout is refit on training + held-out data
    with the chosen λ and saved as GGUF for llama.cpp inference
 
-With `--outtype f16`, `W_res` is rounded to F16 before state collection, so
-the readout is trained on exactly the reservoir inference runs.
+With `--outtype f16`, `q8_0` or `q4_0`, `W_res` is rounded to that type
+before state collection, so the readout is trained on the reservoir
+inference runs. The reservoir is random, so rounding it costs little; what
+matters is that the readout sees the rounded one. Quantizing an F32-trained
+model afterwards (as `llama-quantize` would) puts a different reservoir
+under the readout: at R=2048 that took held-out entropy from 4.77 to 6.86
+bits/byte, where training on the Q4_0 reservoir gives 4.78.
+
+ggml's CPU backend also rounds the state vector before each `W_res`
+product: to F16 for an F16 reservoir, and to Q8_0 blocks (`rint(x * 127 /
+amax)` per 32 values, with the scale stored as F16) for Q8_0 and Q4_0 ones.
+State collection rounds it the same way, so the Python validation numbers
+are what llama.cpp computes on CPU: logits agree to ~1e-6 for Q8_0 and Q4_0
+reservoirs, where unrounded states differed by ~5e-3 and changed the
+next-byte argmax at 2-22 % of positions. An F16 reservoir still differs by
+~1e-4 at some positions, where a state element sits on an F16 rounding
+boundary. Other backends round the vector their own way.
 
 ### Measured Effect of the Training and Inference Optimizations
 
@@ -470,6 +485,27 @@ held-out file, and generates at 70 tok/s from a 536 MiB GGUF. The previous
 script had not finished initializing it after 30 minutes. That this barely
 improves on R=8192 shows the ~67k-sample corpus, not the reservoir, is the
 limit at this scale.
+
+### Quantized Reservoirs
+
+The same corpus and held-out file, with `--embedding-dim 64 --spectral-radius
+0.9 --leaking-rate 0.5 --use-bias --seq-length 256 --washout 32 --reg-grid
+0.1,1,10,100` (674 windows; λ=1 was selected for every model), 4-thread CPU,
+`llama-bench -r 3`:
+
+| | R=2048 F32 | R=2048 F16 | R=2048 Q8_0 | R=2048 Q4_0 | R=8192 F32 | R=8192 F16 | R=8192 Q8_0 | R=8192 Q4_0 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| GGUF size | 19 MB | 11 MB | 7 MB | 5 MB | 267 MB | 139 MB | 79 MB | 47 MB |
+| held-out bits/byte | 4.772 | 4.772 | 4.779 | 4.783 | 4.331 | 4.330 | 4.336 | 4.346 |
+| held-out perplexity | 27.3 | 27.3 | 27.5 | 27.5 | 20.1 | 20.1 | 20.2 | 20.3 |
+| held-out argmax accuracy | 38.5 % | 38.5 % | 38.7 % | 38.6 % | 46.5 % | 46.4 % | 46.2 % | 46.4 % |
+| pp512 (tok/s) | 4935 | 6982 | 6979 | 7976 | 244 | 592 | 826 | 951 |
+| tg128 (tok/s) | 3796 | 5174 | 5770 | 6677 | 220 | 548 | 758 | 922 |
+
+Training time does not depend on the type (47-48 s at R=2048, 448-480 s
+at R=8192). At R=8192 a token's work is mostly reading `W_res`, so Q4_0
+generates 4.2x faster than F32 and 1.7x faster than F16, for 0.015
+bits/byte.
 
 ## Related research directions (not part of this implementation)
 
