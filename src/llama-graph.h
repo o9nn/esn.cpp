@@ -225,6 +225,8 @@ public:
 
     void set_input(const llama_ubatch * ubatch) override;
 
+    bool can_reuse(const llm_graph_params & params) override;
+
     ggml_tensor * s_copy;  // I32 [n_rs]
 
     // views of s_copy, computed once per graph
@@ -233,6 +235,10 @@ public:
     ggml_tensor * s_copy_extra;  // I32 [n_rs - n_seqs]
 
     const llama_memory_recurrent_context * mctx;
+
+    // used in view offsets and sizes, so the graph is only reusable when they match
+    uint32_t head;
+    int32_t  rs_z;
 };
 
 class llm_graph_input_cross_embd : public llm_graph_input_i {
