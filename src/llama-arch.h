@@ -278,6 +278,7 @@ enum llm_kv {
     LLM_KV_ESN_NOISE_LEVEL,
     LLM_KV_ESN_ACTIVATION_TYPE,
     LLM_KV_ESN_BIDIRECTIONAL,
+    LLM_KV_ESN_OUTPUT_TEMPERATURE,
 
     // ESN online learning / infer-train configuration (Phase 3)
     LLM_KV_ESN_ONLINE_LEARNING_ENABLED,

@@ -1698,8 +1698,9 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
     GGML_ASSERT(sched);
     GGML_ASSERT((int)sched->hash_set.size >= measure_graph->n_nodes + measure_graph->n_leafs);
 
-    ggml_backend_sched_reset(sched);
-
+    // no reset here: it would discard the backend assignments the caller made
+    // with ggml_backend_sched_set_tensor_backend while building the graph, so
+    // the reserved splits would differ from the ones computed (as upstream)
     ggml_backend_sched_synchronize(sched);
 
     ggml_backend_sched_split_graph(sched, measure_graph);

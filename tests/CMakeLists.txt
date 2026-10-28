@@ -149,6 +149,8 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         # calls the CPU backend directly
         llama_build_and_test(test-esn-activations.cpp)
     endif()
+    # online readout adaptation; writes its own small models
+    llama_build_and_test(test-esn-online.cpp)
     # These need model/text arguments at runtime, so build without a CTest:
     #   bin/test-esn-inference <esn.gguf>
     #   bin/test-esn-perplexity <esn.gguf> <text-file>

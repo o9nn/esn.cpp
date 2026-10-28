@@ -2,6 +2,7 @@
 
 #include "llama-impl.h"
 #include "llama-batch.h"
+#include "llama-esn.h"
 #include "llama-io.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
@@ -200,6 +201,10 @@ llama_context::llama_context(
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
+
+        if (model.arch == LLM_ARCH_ESN && hparams.esn_online_learning) {
+            esn = std::make_unique<llama_esn_adapter>(model);
+        }
     }
 
     // init backends
@@ -476,6 +481,22 @@ llama_memory_t llama_context::get_memory() const {
     return memory.get();
 }
 
+llama_esn_adapter * llama_context::get_esn() const {
+    return esn.get();
+}
+
+bool llama_context::lora_adapts_readout() const {
+    if (model.output == nullptr) {
+        return false;
+    }
+    for (const auto & lora : loras) {
+        if (lora.first->get_weight(model.output) != nullptr) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool llama_context::memory_update(bool optimize) {
     if (!memory) {
         return false;
@@ -691,12 +712,30 @@ void llama_context::set_warmup(bool value) {
     cparams.warmup = value;
 }
 
-void llama_context::set_adapter_lora(
+bool llama_context::set_adapter_lora(
             llama_adapter_lora * adapter,
             float scale) {
     LLAMA_LOG_DEBUG("%s: adapter = %p, scale = %f\n", __func__, (void *) adapter, scale);
 
+    // the adapted ESN readout replaces model.output in the graph, where a
+    // LoRA on it would no longer apply
+    if (esn && esn->readout() != nullptr && adapter->get_weight(model.output) != nullptr) {
+        LLAMA_LOG_ERROR("%s: the adapter modifies the ESN readout, which this context has adapted online; "
+                "call llama_esn_reset_adaptation first\n", __func__);
+        return false;
+    }
+
+    const auto it = loras.find(adapter);
+    if (it != loras.end() && it->second == scale) {
+        return true;
+    }
     loras[adapter] = scale;
+    // graph reuse compares the adapter set by address only, so a graph built
+    // before this change must not be reused
+    if (gf_res_prev) {
+        gf_res_prev->reset();
+    }
+    return true;
 }
 
 bool llama_context::rm_adapter_lora(
@@ -706,6 +745,9 @@ bool llama_context::rm_adapter_lora(
     auto pos = loras.find(adapter);
     if (pos != loras.end()) {
         loras.erase(pos);
+        if (gf_res_prev) {
+            gf_res_prev->reset();
+        }
         return true;
     }
 
@@ -715,7 +757,15 @@ bool llama_context::rm_adapter_lora(
 void llama_context::clear_adapter_lora() {
     LLAMA_LOG_DEBUG("%s: call\n", __func__);
 
+    // callers such as the server clear before every batch: only an actual
+    // change invalidates the graph
+    if (loras.empty()) {
+        return;
+    }
     loras.clear();
+    if (gf_res_prev) {
+        gf_res_prev->reset();
+    }
 }
 
 bool llama_context::apply_adapter_cvec(
@@ -1200,6 +1250,23 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
         }
 
+        // record the ESN readout inputs for online adaptation; every ubatch
+        // is passed, since decoding a position invalidates older recordings
+        // at and after it even when it produces no output
+        if (esn) {
+            esn_rows.clear();
+            if (n_outputs > 0) {
+                ggml_tensor * t_x = res->get_embd();
+                GGML_ASSERT(t_x != nullptr && t_x->type == GGML_TYPE_F32);
+                ggml_backend_t backend_x = ggml_backend_sched_get_tensor_backend(sched.get(), t_x);
+                GGML_ASSERT(backend_x != nullptr);
+                esn_rows.resize((size_t) n_outputs * t_x->ne[0]);
+                ggml_backend_tensor_get_async(backend_x, t_x, esn_rows.data(), 0, esn_rows.size()*sizeof(float));
+                ggml_backend_sched_synchronize(sched.get());
+            }
+            esn->capture(ubatch, n_outputs, esn_rows.data(), memory.get());
+        }
+
         n_outputs_prev += n_outputs;
     } while (mctx->next());
 
@@ -1443,6 +1510,8 @@ llm_graph_params llama_context::graph_params(
         /*.loras       =*/ &loras,
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
+        /*.esn_readout =*/ esn ? esn->readout() : nullptr,
+        /*.esn_capture =*/ esn != nullptr,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
@@ -2481,9 +2550,7 @@ int32_t llama_set_adapter_lora(
             llama_context * ctx,
             llama_adapter_lora * adapter,
             float scale) {
-    ctx->set_adapter_lora(adapter, scale);
-
-    return 0;
+    return ctx->set_adapter_lora(adapter, scale) ? 0 : -1;
 }
 
 int32_t llama_rm_adapter_lora(

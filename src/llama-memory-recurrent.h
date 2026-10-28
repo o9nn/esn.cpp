@@ -51,6 +51,8 @@ public:
     llama_pos seq_pos_min(llama_seq_id seq_id) const override;
     llama_pos seq_pos_max(llama_seq_id seq_id) const override;
 
+    uint64_t seq_epoch(llama_seq_id seq_id) const override;
+
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
 
     bool prepare(const std::vector<llama_ubatch> & ubatches);
@@ -108,6 +110,10 @@ private:
     const llama_hparams & hparams;
 
     const uint32_t n_seq_max = 1;
+
+    // seq_epoch() is epoch_all + epoch_seq[seq_id]; both only grow
+    uint64_t                         epoch_all = 0;
+    std::map<llama_seq_id, uint64_t> epoch_seq;
 
     std::vector<ggml_context_ptr>        ctxs;
     std::vector<ggml_backend_buffer_ptr> bufs;

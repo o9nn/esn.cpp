@@ -19,6 +19,7 @@
 #endif
 
 #include "llama.h"
+#include "ggml-backend.h"
 
 #include <cassert>
 #include <cmath>
@@ -56,6 +57,7 @@ int main(int argc, char ** argv) {
 
     llama_log_set(silent_log, nullptr);
     llama_backend_init();
+    ggml_backend_load_all();
 
     llama_model_params mparams = llama_model_default_params();
     mparams.use_mmap     = false;

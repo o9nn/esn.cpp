@@ -32,6 +32,7 @@
 #endif
 
 #include "llama.h"
+#include "ggml-backend.h"
 
 #include <cassert>
 #include <cmath>
@@ -190,8 +191,11 @@ int main(int argc, char ** argv) {
     const std::string model_path = argv[1];
     fprintf(stderr, "test-esn-inference: using '%s'\n", model_path.c_str());
 
-    llama_log_set(silent_log, nullptr);
+    if (getenv("ESN_TEST_LOG") == nullptr) {
+        llama_log_set(silent_log, nullptr);
+    }
     llama_backend_init();
+    ggml_backend_load_all();
 
     llama_model_params mparams = llama_model_default_params();
     mparams.use_mmap     = false;

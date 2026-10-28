@@ -55,7 +55,7 @@ sign off on criteria 1–4, 6, 7 by inspection of the file set; criterion
 
 | Requirement | Satisfied by | Evidence |
 |---|---|---|
-| Hyperparameters load from GGUF | `src/llama-model.cpp` (`llm_load_hparams` ESN branch) | reservoir size, spectral radius, sparsity, leaking rate, input scaling, feedback scaling, noise, activation, bidirectional |
+| Hyperparameters load from GGUF | `src/llama-model.cpp` (`llm_load_hparams` ESN branch) | reservoir size, spectral radius, sparsity, leaking rate, input scaling, feedback scaling, noise, activation, output temperature, online learning; bidirectional and hierarchical settings are refused |
 | Tensors load with correct shapes | `src/llama-model.cpp` (`llm_load_tensors` ESN branch) | `ggml_mul_mat` semantics respected — `ne[0]` is the contracted axis for each weight |
 | Recurrent memory sized correctly | `src/llama-hparams.cpp` | `n_embd_s()` returns `esn_reservoir_size` for `LLM_ARCH_ESN` |
 
@@ -140,6 +140,7 @@ and Inference Optimizations" in `docs/esn.md`.
 | Arch registry | `tests/test-esn.cpp` (CTest, 8 asserts) |
 | C API end-to-end | `tests/test-esn-inference.cpp` (build-only; takes a model path) |
 | Numerical correctness vs. baseline | `tests/test-esn-perplexity.cpp` (build-only; takes a model + text) |
+| Online readout adaptation (`llama_esn_*`) | `tests/test-esn-online.cpp` (CTest; writes its own models, or takes one) |
 
 **Verified by**: `ctest -R test-esn --verbose` passes; both build-only tests pass on the markdown-trained model.
 

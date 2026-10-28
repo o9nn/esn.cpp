@@ -127,6 +127,7 @@ void llama_memory_recurrent::clear(bool data) {
 
     head = 0;
     used = 0;
+    ++epoch_all;
 
     if (data) {
         for (auto & buf : bufs) {
@@ -210,6 +211,8 @@ void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id
         return;
     }
 
+    ++epoch_seq[seq_id_dst];
+
     if (p0 < 0) {
         p0 = 0;
     }
@@ -292,6 +295,8 @@ void llama_memory_recurrent::seq_add(llama_seq_id seq_id, llama_pos p0, llama_po
         return;
     }
 
+    ++epoch_seq[seq_id];
+
     // for Mamba-like or RWKV models, only the pos needs to be shifted
     if (0 <= seq_id && seq_id < (int64_t) size) {
         const int32_t tail_id = cells[seq_id].tail;
@@ -322,6 +327,8 @@ void llama_memory_recurrent::seq_div(llama_seq_id seq_id, llama_pos p0, llama_po
         return;
     }
 
+    ++epoch_seq[seq_id];
+
     // for Mamba-like or RWKV models, only the pos needs to be changed
     if (0 <= seq_id && seq_id < (int64_t) size) {
         const int32_t tail_id = cells[seq_id].tail;
@@ -332,6 +339,11 @@ void llama_memory_recurrent::seq_div(llama_seq_id seq_id, llama_pos p0, llama_po
             }
         }
     }
+}
+
+uint64_t llama_memory_recurrent::seq_epoch(llama_seq_id seq_id) const {
+    const auto it = epoch_seq.find(seq_id);
+    return epoch_all + (it != epoch_seq.end() ? it->second : 0);
 }
 
 llama_pos llama_memory_recurrent::seq_pos_min(llama_seq_id seq_id) const {
@@ -733,6 +745,12 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
 
 void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
     GGML_UNUSED(flags);
+
+    if (seq_id == -1) {
+        ++epoch_all;
+    } else {
+        ++epoch_seq[seq_id];
+    }
 
     uint32_t cell_count;
     io.read_to(&cell_count, sizeof(cell_count));

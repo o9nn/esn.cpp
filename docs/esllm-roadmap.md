@@ -43,8 +43,8 @@ Proprioceptive signals are routed through the `llama_esn_feedback_event` API and
 | **Bounded latency** | Online train step is O(R²) and must complete in < 1 ms for R ≤ 4096 on CPU |
 | **Stable reservoir dynamics** | Spectral radius is validated at load time to be in (0, 1) |
 | **Non-destructive continual updates** | Only `W_out` is adapted; `W_res`, `W_in` are read-only after model load |
-| **Reproducible checkpoints** | State + readout weights can be serialised via `llama_state_*` APIs at any point |
-| **Safe online updates** | All updates are bounded by L2 regularisation; a drift detector can trigger rollback |
+| **Reversible updates** | The model's `W_out` is never modified; `llama_esn_reset_adaptation` returns a context to it (the adapted readout is not yet part of `llama_state_*` data) |
+| **Regularized online updates** | Ridge and RLS updates are anchored to the checkpoint by λ‖W − W₀‖²; drift detection is Phase 8 |
 
 ### 1.3 ESN/ESLLM Capability Matrix
 
@@ -52,18 +52,17 @@ Proprioceptive signals are routed through the `llama_esn_feedback_event` API and
 |-----------|---------------|----------------|
 | Single-layer ESN inference | ✅ Implemented | ✅ Keep |
 | Batch ridge regression training | ✅ Python utility | ✅ Keep |
-| Online RLS adaptation | ✅ Python utility | ✅ Runtime (C++) |
-| Online SGD adaptation | ✅ Python utility | ✅ Runtime (C++) |
+| Online ridge / RLS / SGD readout adaptation | ✅ Python utility and C++ runtime (`llama_esn_update_readout`) | ✅ Keep |
 | Parameter validation at load | ✅ Implemented | ✅ Keep |
-| Proprioceptive feedback API | ✅ Header-defined stubs | 🔄 Full implementation |
-| Synchronous infer-train loop | ❌ Not yet | 🎯 Phase 4 |
-| Hierarchical reservoir (DTE) | ❌ Config only | 🎯 Phase 6 |
+| Proprioceptive feedback API | ✅ Implemented (`src/llama-esn.cpp`, `tests/test-esn-online.cpp`) | ✅ Keep |
+| Synchronous infer-train loop in CLI/server | ❌ Not yet (the API supports it) | 🎯 Phase 4 |
+| Hierarchical reservoir (DTE) | ❌ Keys reserved; models that set them are refused at load | 🎯 Phase 6 |
 | ESN–Transformer hybrid | ❌ Not yet | 🎯 Phase 7 |
 | Drift detection + rollback | ❌ Not yet | 🎯 Phase 8 |
 | Online learning GGUF metadata | ✅ Implemented | ✅ Keep |
 | Safety/policy gates | ❌ Not yet | 🎯 Phase 8 |
 | Research benchmark suite | ❌ Not yet | 🎯 Phase 9 |
-| Full API surface in llama.h | ✅ Stubs implemented | 🔄 Phase 10 |
+| Full API surface in llama.h | ✅ Implemented for online adaptation | 🔄 Phase 10 |
 
 ---
 
@@ -129,11 +128,11 @@ All of the following are loaded from GGUF metadata and fall back to safe default
 
 ```bash
 # RLS online training (efficient for sequential adaptation)
-python scripts/esn_training.py --reservoir-size 1024 --online --online-mode rls \
+python scripts/esn_training.py --reservoir-size 1024 --train-data corpus.txt --online --online-mode rls \
     --forgetting-factor 0.999 --save-online-metadata --output esllm.gguf
 
 # SGD online training (standard gradient descent)
-python scripts/esn_training.py --reservoir-size 1024 --online --online-mode sgd \
+python scripts/esn_training.py --reservoir-size 1024 --train-data corpus.txt --online --online-mode sgd \
     --online-lr 1e-4 --weight-decay 1e-5 --output esllm_sgd.gguf
 ```
 
@@ -143,9 +142,11 @@ Key classes:
 - `ESN.sgd_update(state, target)` — one online SGD step (O(V·R))
 - `ESN.online_train_sequence(...)` — process a complete token sequence online
 
-### 3.3 C++ API Stubs
+### 3.3 C++ API
 
-Declared in `include/llama.h`:
+Declared in `include/llama.h`, implemented in `src/llama-esn.cpp` (see
+`docs/esn.md`, "Online readout adaptation"), tested by
+`tests/test-esn-online.cpp`:
 
 ```c
 struct llama_esn_online_params { ... };
@@ -334,8 +335,8 @@ When drift exceeds threshold, the monitor:
 ### 8.2 Rollback Checkpoints
 
 - A "golden" checkpoint (the static GGUF weights) is always held in memory.
-- `llama_esn_reset_adaptation()` restores `W_out` to the golden checkpoint weights instantly.
-- Periodic automatic checkpoints can be saved with `llama_state_save_file()`.
+- `llama_esn_reset_adaptation()` returns a context to the golden checkpoint `W_out` (implemented).
+- Periodic checkpoints of the adapted readout need it in `llama_state_*` data (not yet).
 
 ### 8.3 Policy Controls
 

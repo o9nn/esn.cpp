@@ -419,6 +419,13 @@ struct llm_graph_params {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
 
+    // ESN: per-context readout trained online (llama_esn_update_readout),
+    // used in place of the model's output tensor when not null
+    ggml_tensor * esn_readout = nullptr;
+    // ESN: keep result_norm (the readout input) as a graph output so the
+    // context can capture it for online learning
+    bool esn_capture = false;
+
     uint32_t n_outputs;
 
     llm_graph_cb cb;
@@ -466,6 +473,8 @@ struct llm_graph_params {
             cvec      == other.cvec  &&
             loras     == other.loras &&
             cross     == other.cross &&
+            esn_readout == other.esn_readout &&
+            esn_capture == other.esn_capture &&
             n_outputs == other.n_outputs;
     }
 };
@@ -581,6 +590,9 @@ struct llm_graph_context {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
+
+    ggml_tensor * esn_readout;
+    bool          esn_capture;
 
     const llm_graph_cb & cb_func;
 

@@ -58,14 +58,14 @@ int main() {
     {
         std::cout << "Test 3: ESN tensor info mappings... ";
         const llm_tensor_info & input_info = llm_tensor_info_for(LLM_TENSOR_ESN_INPUT_WEIGHTS);
-        assert(input_info.layer == LLM_TENSOR_LAYER_INPUT);
+        assert(input_info.layer == LLM_TENSOR_LAYER_REPEATING);
         assert(input_info.op == GGML_OP_MUL_MAT);
 
-        // ESN has exactly one reservoir layer and is addressed as layers[0],
-        // so reservoir tensors are classified as non-repeating INPUT (otherwise
-        // the loader asserts "repeating layer tensor used without a layer number").
+        // ESN has exactly one reservoir layer, addressed as layers[0]: the
+        // tensors the recurrence reads are REPEATING (created with block 0) so
+        // they share layer 0's device with the recurrent state.
         const llm_tensor_info & reservoir_info = llm_tensor_info_for(LLM_TENSOR_ESN_RESERVOIR_WEIGHTS);
-        assert(reservoir_info.layer == LLM_TENSOR_LAYER_INPUT);
+        assert(reservoir_info.layer == LLM_TENSOR_LAYER_REPEATING);
         assert(reservoir_info.op == GGML_OP_MUL_MAT);
         const llm_tensor_info & output_info = llm_tensor_info_for(LLM_TENSOR_ESN_OUTPUT_WEIGHTS);
         assert(output_info.layer == LLM_TENSOR_LAYER_OUTPUT);
@@ -73,16 +73,16 @@ int main() {
 
         // Optional tensor infos
         const llm_tensor_info & fb_info  = llm_tensor_info_for(LLM_TENSOR_ESN_FEEDBACK_WEIGHTS);
-        assert(fb_info.layer == LLM_TENSOR_LAYER_INPUT);
+        assert(fb_info.layer == LLM_TENSOR_LAYER_REPEATING);
         assert(fb_info.op == GGML_OP_GET_ROWS);  // row per fed-back token
         const llm_tensor_info & ib_info  = llm_tensor_info_for(LLM_TENSOR_ESN_INPUT_BIAS);
-        assert(ib_info.layer == LLM_TENSOR_LAYER_INPUT);
+        assert(ib_info.layer == LLM_TENSOR_LAYER_REPEATING);
         assert(ib_info.op == GGML_OP_ADD);
         const llm_tensor_info & rb_info  = llm_tensor_info_for(LLM_TENSOR_ESN_RESERVOIR_BIAS);
-        assert(rb_info.layer == LLM_TENSOR_LAYER_INPUT);
+        assert(rb_info.layer == LLM_TENSOR_LAYER_REPEATING);
         assert(rb_info.op == GGML_OP_ADD);
         const llm_tensor_info & it_info  = llm_tensor_info_for(LLM_TENSOR_ESN_INPUT_TABLE);
-        assert(it_info.layer == LLM_TENSOR_LAYER_INPUT);
+        assert(it_info.layer == LLM_TENSOR_LAYER_REPEATING);
         assert(it_info.op == GGML_OP_GET_ROWS);  // row per input token
         std::cout << "PASSED\n";
     }

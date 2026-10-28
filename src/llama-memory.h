@@ -109,6 +109,12 @@ struct llama_memory_i {
     virtual llama_pos seq_pos_min(llama_seq_id seq_id) const = 0;
     virtual llama_pos seq_pos_max(llama_seq_id seq_id) const = 0;
 
+    // changes whenever the content of seq_id is replaced rather than extended
+    // or truncated (clear, seq_cp onto it, shifted positions, state restore),
+    // so that state keyed by (seq_id, pos) can detect that it is stale;
+    // 0 for memories that do not track it
+    virtual uint64_t seq_epoch(llama_seq_id /*seq_id*/) const { return 0; }
+
     virtual std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const = 0;
 
     //

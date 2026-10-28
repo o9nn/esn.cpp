@@ -550,92 +550,121 @@ extern "C" {
     LLAMA_API bool llama_model_is_diffusion(const struct llama_model * model);
 
     //
-    // ESN / ESLLM – Synchronous infer-train and proprioceptive feedback API
+    // ESN – online readout adaptation
     //
-    // These types and functions provide the building blocks for the ESLLM
-    // "synchronous infer-train" execution model described in docs/esllm-roadmap.md.
+    // An ESN's reservoir is fixed; its linear readout W_out can be retrained
+    // per context from feedback on the outputs it produced. Contexts on a
+    // model exported with esn.online_learning.enabled record the readout
+    // input (the RMS-normalized reservoir state) of every output position
+    // they decode; a feedback event names a (seq_id, pos) whose logits were
+    // read and the token(s) the readout should have produced there.
+    // llama_esn_update_readout() then fits the context's own copy of W_out,
+    // which every later decode on that context uses. The model's W_out is not
+    // modified, so other contexts are unaffected, and the adapted readout is
+    // not part of the llama_state_* data.
     //
-    // Design invariants:
-    //   - Reservoir weights are always frozen during adaptation (echo state property).
-    //   - Only the linear readout (W_out) is updated online.
-    //   - Every online update is bounded by regularization to prevent drift.
-    //   - State and readout checkpoints can be serialised via llama_state_* APIs.
+    // Error codes shared by these functions:
+    //   -1 the model is not an ESN
+    //   -2 ctx is NULL
+    //   -3 invalid argument (see each function)
+    //   -4 the model was not exported with esn.online_learning.enabled
+    //   -5 the feedback buffer (esn.online_learning.buf_size samples) is full
+    //   -6 a least-squares mode needs esn.output_temperature, which the model lacks
+    //   -7 a least-squares mode was given samples with negative weight
+    //   -8 the readout could not be read or allocated (see the log)
+    //   -9 the least-squares solve was numerically singular; raise regularization
+    //  -10 a LoRA adapter on the context modifies the readout
+    //
+    // Positions are tracked per sequence: decoding a position again (after
+    // llama_memory_seq_rm or a memory clear) discards what was recorded at
+    // and after it, and feedback is refused for positions past the newest one
+    // the context's memory holds or recorded before its content was replaced
+    // (state restore, llama_memory_seq_cp onto the sequence).
     //
 
-    // Type of feedback signal carried in a llama_esn_feedback_event.
     enum llama_esn_feedback_type {
-        LLAMA_ESN_FEEDBACK_CORRECTION  = 0, // explicit token-level correction by the user
-        LLAMA_ESN_FEEDBACK_REWARD      = 1, // scalar reward / penalty signal
-        LLAMA_ESN_FEEDBACK_CONFIDENCE  = 2, // model output confidence (self-supervised)
-        LLAMA_ESN_FEEDBACK_TOOL_RESULT = 3, // structured result from a tool/function call
-        LLAMA_ESN_FEEDBACK_LATENCY     = 4, // observed latency of the last generation step
+        // target_tokens[k] is the token the readout should have produced at
+        // pos + k; each is a sample of weight 1
+        LLAMA_ESN_FEEDBACK_CORRECTION  = 0,
+        // target_tokens[k] were produced at pos + k and earned reward `signal`:
+        // weight = signal (negative pushes probability away; SGD only)
+        LLAMA_ESN_FEEDBACK_REWARD      = 1,
+        // like REWARD with signal in [0, 1] (self-training on confident outputs)
+        LLAMA_ESN_FEEDBACK_CONFIDENCE  = 2,
+        // target_tokens are what a tool returned, to be predicted from pos on;
+        // weight 1, as CORRECTION
+        LLAMA_ESN_FEEDBACK_TOOL_RESULT = 3,
+        // rejected with -3: latency carries no token target and does not
+        // depend on the readout
+        LLAMA_ESN_FEEDBACK_LATENCY     = 4,
     };
 
-    // A single proprioceptive feedback event emitted during or after inference.
-    // Submit a batch of these to llama_esn_submit_feedback() to drive online adaptation.
     struct llama_esn_feedback_event {
         enum llama_esn_feedback_type type;
-        llama_seq_id                 seq_id;          // sequence that produced this event
-        llama_pos                    pos;              // token position the feedback refers to
-        float                        signal;           // scalar value: reward, confidence, latency, …
-        const llama_token *          target_tokens;    // optional ground-truth target tokens
-        int32_t                      n_target_tokens;  // number of target tokens (0 = none)
+        llama_seq_id                 seq_id;           // sequence the outputs belong to
+        llama_pos                    pos;              // position whose logits produced the first target
+        float                        signal;           // reward or confidence (see the type)
+        const llama_token *          target_tokens;    // required: one target per position from pos on
+        int32_t                      n_target_tokens;  // >= 1
     };
 
-    // Parameters controlling the online-adaptation behaviour of an ESN/ESLLM model.
-    // Obtain defaults with llama_esn_online_params_default(), then customise.
     struct llama_esn_online_params {
-        bool     enabled;           // master switch: enable online readout adaptation
-        uint32_t update_mode;       // 0=batch_ridge, 1=recursive_least_squares, 2=sgd
-        float    learning_rate;     // step size (SGD/RLS); ignored for batch ridge
-        float    regularization;    // L2 / Tikhonov regularization coefficient
-        float    decay_rate;        // exponential forgetting: [0 = no forgetting, 1 = full reset)
-        uint32_t replay_window;     // sliding replay buffer length (in tokens)
-        bool     freeze_reservoir;  // if true, keep W_res / W_in frozen (should always be true)
+        bool     enabled;           // false: llama_esn_update_readout does nothing and returns 0
+        uint32_t update_mode;       // 0 = batch ridge, 1 = recursive least squares, 2 = SGD
+        float    learning_rate;     // SGD step size (> 0); unused by ridge and RLS
+        float    regularization;    // ridge/RLS: lambda > 0 (pull toward the checkpoint);
+                                    // SGD: >= 0, L2 pull toward the checkpoint
+        float    decay_rate;        // [0, 1): ridge down-weights a sample by (1 - decay)^age,
+                                    // RLS forgets samples and the pull toward the
+                                    // checkpoint alike by 1 - decay; unused by SGD
+        uint32_t replay_window;     // >= 1: samples kept for ridge, which refits from the
+                                    // checkpoint on the newest replay_window samples each update
+        bool     freeze_reservoir;  // must be true (-3 otherwise): only W_out is trained
     };
 
-    // Returns a safe default llama_esn_online_params with adaptation disabled.
+    // Defaults: disabled, ridge, lr 1e-4, regularization 1e-6, no decay,
+    // window 256, frozen reservoir.
     LLAMA_API struct llama_esn_online_params llama_esn_online_params_default(void);
 
-    // Returns true if the model was saved with online-learning enabled in its GGUF metadata.
+    // The online parameters exported with the model (esn.online_learning.*,
+    // esn.replay_window); enabled is true iff llama_esn_is_adaptive(model).
+    LLAMA_API struct llama_esn_online_params llama_esn_model_online_params(const struct llama_model * model);
+
+    // True if the model is an ESN exported with esn.online_learning.enabled.
     LLAMA_API bool llama_esn_is_adaptive(const struct llama_model * model);
 
-    // Submit a batch of proprioceptive feedback events to the given context.
-    //
-    // Events are accumulated in an internal replay buffer (bounded by
-    // esn_online_buffer_size).  They are consumed on the next call to
-    // llama_esn_update_readout().
-    //
-    // Returns 0 on success, or a negative error code.
-    // Returns -1 if the model is not an ESN architecture.
-    // Returns -2 if ctx is NULL.
+    // Turn feedback events into training samples, using the readout inputs
+    // recorded when the referenced positions were decoded with logits (the
+    // newest esn.replay_window positions of each sequence are kept). All
+    // events are validated first; on error none is added.
+    // Returns 0 on success; -3 for an unknown or LATENCY type, missing or
+    // out-of-range targets, a non-finite reward, a confidence outside [0, 1],
+    // or a position with no recorded readout input; -5 if the batch would
+    // overflow the feedback buffer; -1, -2, -4.
     LLAMA_API int32_t llama_esn_submit_feedback(
             struct llama_context *                  ctx,
             const struct llama_esn_feedback_event * events,
             int32_t                                 n_events);
 
-    // Trigger an online readout-weight update using the accumulated feedback buffer.
-    //
-    // This is the "train step" of the synchronous infer-train loop.  It updates
-    // W_out (and only W_out) using the algorithm specified in params->update_mode.
-    // The reservoir weights are always left untouched.
-    //
-    // Returns the number of feedback events consumed, or a negative error code.
-    // Returns -1 if the model is not an ESN architecture.
-    // Returns -2 if ctx is NULL.
+    // Train the context's readout on the submitted samples (see
+    // llama_esn_online_params). Ridge and RLS fit W_out x to T * one-hot,
+    // T = esn.output_temperature, the scale the exported readout was fit to.
+    // Returns the number of events consumed (0 if none were pending or
+    // params->enabled is false); -3 for invalid params; -1, -2, -4, -6, -7,
+    // -8, -9, -10. On error the readout and the pending samples are unchanged.
     LLAMA_API int32_t llama_esn_update_readout(
             struct llama_context *              ctx,
             const struct llama_esn_online_params * params);
 
-    // Discard all accumulated feedback events and reset the readout weights to
-    // the values stored in the GGUF checkpoint.
-    // No-op if the model is not an ESN architecture.
+    // Discard pending and replayed samples and return the context to the
+    // model's W_out. No-op for other contexts.
     LLAMA_API void llama_esn_reset_adaptation(struct llama_context * ctx);
 
     // Returns the reservoir size of an ESN model (0 if model is not ESN).
     LLAMA_API uint32_t llama_esn_reservoir_size(const struct llama_model * model);
 
-    // Returns the number of hierarchical reservoir levels (1 for flat ESN).
+    // Returns the number of reservoir levels (always 1: hierarchical models
+    // are refused at load), or 0 if the model is not an ESN.
     LLAMA_API uint32_t llama_esn_n_levels(const struct llama_model * model);
 
     // Returns 0 on success
@@ -683,6 +712,8 @@ extern "C" {
 
     // Add a loaded LoRA adapter to given context
     // This will not modify model's weight
+    // Returns -1 if the adapter modifies an ESN readout the context has
+    // adapted online (see llama_esn_reset_adaptation), 0 otherwise
     LLAMA_API int32_t llama_set_adapter_lora(
             struct llama_context * ctx,
             struct llama_adapter_lora * adapter,

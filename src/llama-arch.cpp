@@ -273,6 +273,7 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_ESN_NOISE_LEVEL,       "esn.noise_level"       },
     { LLM_KV_ESN_ACTIVATION_TYPE,   "esn.activation_type"   },
     { LLM_KV_ESN_BIDIRECTIONAL,     "esn.bidirectional"     },
+    { LLM_KV_ESN_OUTPUT_TEMPERATURE, "esn.output_temperature" },
 
     // Online learning / infer-train
     { LLM_KV_ESN_ONLINE_LEARNING_ENABLED, "esn.online_learning.enabled"  },
@@ -2465,19 +2466,20 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
     {LLM_TENSOR_NEXTN_SHARED_HEAD_NORM,     {LLM_TENSOR_LAYER_OUTPUT, GGML_OP_MUL}},
     // ESN specific tensors.
     //
-    // ESN logically has exactly one reservoir "layer" and we address it as
-    // layers[0] in the C++ loader. The create_tensor() calls use tn(...)
-    // without a layer index, so these tensors must be classified as non-
-    // repeating (INPUT / OUTPUT) — otherwise the loader asserts
-    // "repeating layer tensor used without a layer number". Classifying them
-    // as INPUT also keeps the GGUF tensor names stable (no blk.N. prefix).
-    {LLM_TENSOR_ESN_INPUT_WEIGHTS,          {LLM_TENSOR_LAYER_INPUT,  GGML_OP_MUL_MAT}},
-    {LLM_TENSOR_ESN_RESERVOIR_WEIGHTS,      {LLM_TENSOR_LAYER_INPUT,  GGML_OP_MUL_MAT}},
-    {LLM_TENSOR_ESN_OUTPUT_WEIGHTS,         {LLM_TENSOR_LAYER_OUTPUT, GGML_OP_MUL_MAT}},
-    {LLM_TENSOR_ESN_FEEDBACK_WEIGHTS,       {LLM_TENSOR_LAYER_INPUT,  GGML_OP_GET_ROWS}},
-    {LLM_TENSOR_ESN_INPUT_BIAS,             {LLM_TENSOR_LAYER_INPUT,  GGML_OP_ADD}},
-    {LLM_TENSOR_ESN_RESERVOIR_BIAS,         {LLM_TENSOR_LAYER_INPUT,  GGML_OP_ADD}},
-    {LLM_TENSOR_ESN_INPUT_TABLE,            {LLM_TENSOR_LAYER_INPUT,  GGML_OP_GET_ROWS}},
+    // ESN logically has exactly one reservoir "layer", addressed as layers[0]
+    // in the C++ loader. The tensors the recurrence reads are REPEATING so
+    // they are placed on layer 0's device with the recurrent state: every
+    // unrolled step multiplies by W_res and adds the input drive, and an
+    // operand on another backend would make each step a separate split
+    // input. create_tensor() passes block 0 for them; their GGUF names carry
+    // no block number (no blk.N. prefix), so the names stay as they were.
+    {LLM_TENSOR_ESN_INPUT_WEIGHTS,          {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_ESN_RESERVOIR_WEIGHTS,      {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_ESN_OUTPUT_WEIGHTS,         {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_ESN_FEEDBACK_WEIGHTS,       {LLM_TENSOR_LAYER_REPEATING, GGML_OP_GET_ROWS}},
+    {LLM_TENSOR_ESN_INPUT_BIAS,             {LLM_TENSOR_LAYER_REPEATING, GGML_OP_ADD}},
+    {LLM_TENSOR_ESN_RESERVOIR_BIAS,         {LLM_TENSOR_LAYER_REPEATING, GGML_OP_ADD}},
+    {LLM_TENSOR_ESN_INPUT_TABLE,            {LLM_TENSOR_LAYER_REPEATING, GGML_OP_GET_ROWS}},
 };
 
 LLM_KV::LLM_KV(llm_arch arch, const char * suffix) : arch(arch), suffix(suffix) {}
