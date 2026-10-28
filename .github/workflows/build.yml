@@ -398,10 +398,17 @@ jobs:
         id: checkout
         uses: actions/checkout@v4
 
+      - name: CPU fingerprint
+        id: cpu
+        # GGML_NATIVE (the default) builds with -march=native, and ccache 4.5
+        # hashes that flag literally, so key the cache on the runner's CPU
+        # features to never reuse objects built for a different CPU
+        run: echo "fingerprint=$(grep -E '^(model name|flags|CPU part|Features)' /proc/cpuinfo | sort -u | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.16
         with:
-          key: ubuntu-24-cmake-vulkan
+          key: ubuntu-24-cmake-vulkan-${{ steps.cpu.outputs.fingerprint }}
           evict-old-files: 1d
 
       - name: Dependencies

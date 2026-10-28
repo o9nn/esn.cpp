@@ -19523,16 +19523,25 @@ struct llm_build_esn : public llm_graph_context_mamba {
         //   x(t+1) = (1-α)·x(t) + α·f(W_res·x(t) + W_in·u(t) + W_fb·y(t-1) + b)
         //
         // We keep the (per-sequence) reservoir state current across the
-        // loop. With more than one timestep, each step's state is also
-        // written into its row of `states`, laid out [reservoir_size,
-        // n_seq_tokens, n_seqs] so that it flattens to one reservoir vector
-        // per input token in the order inp_out_ids indexes. Every
-        // ggml_set_rows returns a view of the whole buffer that depends on
-        // the previous write, so reading the last one sees all of them, and
-        // the stacking costs one row copy per step.
+        // loop, and stack every step's state so the output has one reservoir
+        // vector per input token, laid out [reservoir_size, n_seq_tokens,
+        // n_seqs] so it flattens in the order inp_out_ids indexes.
+        //
+        // When the CPU is the only backend, each step's state is written into
+        // its row of `states` with ggml_set_rows: one row copy per step. Every
+        // write returns a view of the whole buffer that depends on the
+        // previous one, so reading the last sees them all. The row index is a
+        // per-step view of an input, though, and with another backend in the
+        // scheduler each such view becomes a separate split input; more than
+        // GGML_SCHED_MAX_SPLIT_INPUTS of them abort the graph. Then the steps
+        // are concatenated pairwise in a balanced tree instead (each copied
+        // log2(n) times), which keeps every operand on the backend that
+        // computed it.
+        const bool stack_rows = n_seq_tokens > 1 && ggml_backend_sched_get_n_backends(sched) == 1;
+        std::vector<ggml_tensor *> per_step;
         ggml_tensor * states = nullptr;
         ggml_tensor * steps  = nullptr;
-        if (n_seq_tokens > 1) {
+        if (stack_rows) {
             auto inp = std::make_unique<llm_graph_input_esn_steps>();
             inp->steps = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_seq_tokens);
             ggml_set_input(inp->steps);
@@ -19540,6 +19549,8 @@ struct llm_build_esn : public llm_graph_context_mamba {
             res->add_input(std::move(inp));
 
             states = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, reservoir_size, n_seq_tokens, n_seqs);
+        } else if (n_seq_tokens > 1) {
+            per_step.reserve(n_seq_tokens);
         }
 
         ggml_tensor * state = reservoir_state; // [reservoir_size, n_seqs]
@@ -19574,6 +19585,8 @@ struct llm_build_esn : public llm_graph_context_mamba {
                 states = ggml_set_rows(ctx0, states,
                     ggml_reshape_3d(ctx0, state, reservoir_size, 1, n_seqs),
                     ggml_view_1d(ctx0, steps, 1, t * ggml_element_size(steps)));
+            } else if (n_seq_tokens > 1) {
+                per_step.push_back(state);
             }
         }
         cb(state, "esn_reservoir_final", -1);
@@ -19590,9 +19603,30 @@ struct llm_build_esn : public llm_graph_context_mamba {
         // The per-token output expected downstream: {reservoir_size, n_tokens},
         // one column per input token. For the common single-token decode
         // step this is just the state.
-        ggml_tensor * cur = states
-            ? ggml_reshape_2d(ctx0, states, reservoir_size, n_tokens)
-            : ggml_reshape_2d(ctx0, state,  reservoir_size, n_seqs);
+        ggml_tensor * cur;
+        if (n_seq_tokens == 1) {
+            cur = ggml_reshape_2d(ctx0, state, reservoir_size, n_seqs);
+        } else if (states) {
+            cur = ggml_reshape_2d(ctx0, states, reservoir_size, n_tokens);
+        } else {
+            std::vector<ggml_tensor *> level;
+            level.reserve(n_seq_tokens);
+            for (ggml_tensor * s : per_step) {
+                level.push_back(ggml_reshape_3d(ctx0, s, reservoir_size, 1, n_seqs));
+            }
+            while (level.size() > 1) {
+                std::vector<ggml_tensor *> next;
+                next.reserve((level.size() + 1) / 2);
+                for (size_t i = 0; i + 1 < level.size(); i += 2) {
+                    next.push_back(ggml_concat(ctx0, level[i], level[i + 1], 1));
+                }
+                if (level.size() % 2 == 1) {
+                    next.push_back(level.back());
+                }
+                level = std::move(next);
+            }
+            cur = ggml_reshape_2d(ctx0, level[0], reservoir_size, n_tokens);
+        }
         cb(cur, "esn_reservoir_seq", -1);
 
         if (inp_out_ids) {

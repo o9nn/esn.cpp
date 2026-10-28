@@ -113,7 +113,10 @@ The ESN forward pass (`llm_build_esn` in `src/llama-model.cpp`) consists of:
    written into its row of a `[reservoir_size, n_seq_tokens, n_seqs]`
    buffer with `ggml_set_rows`, one row copy per step. Each write returns a
    view of the whole buffer that depends on the previous one, so reading
-   the last sees them all
+   the last sees them all. The row index is a per-step view of a CPU input,
+   which a GPU backend would copy as one split input per step (and abort
+   past `GGML_SCHED_MAX_SPLIT_INPUTS`), so with more than one backend the
+   steps are concatenated in a balanced `ggml_concat` tree instead
 9. **Output Normalization & Projection**: RMS norm, then
    `W_out * reservoir_state → vocabulary_logits`
 
@@ -520,7 +523,8 @@ the table below at R = 2048 and 8192):
   for consecutive decode steps.
 - **O(n) output stacking.** Prompt processing stacked the per-token
   states in a balanced `ggml_concat` tree, copying each state log2(n)
-  times; it now writes each state once (step 8 above).
+  times; it now writes each state once (step 8 above) when the CPU is the
+  only backend.
 
 | R | 256 | 1024 | 2048 | 8192 |
 |---|---:|---:|---:|---:|
