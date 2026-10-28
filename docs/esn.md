@@ -104,9 +104,11 @@ The ESN forward pass (`llm_build_esn` in `src/llama-model.cpp`) consists of:
 6. **Leaky Integration**: `x(t+1) = (1-α)*x(t) + α*f(...)` (skipped when α = 1)
 7. **State Storage**: `ggml_cpy` new state back to `esn_states_all` at
    `kv_head * reservoir_size`
-8. **Output Stacking**: for multi-token batches, the per-token states are
-   concatenated in a balanced binary tree (O(n log n) bytes copied rather
-   than O(n²) for a left-to-right chain)
+8. **Output Stacking**: for multi-token batches, each step's state is
+   written into its row of a `[reservoir_size, n_seq_tokens, n_seqs]`
+   buffer with `ggml_set_rows`, one row copy per step. Each write returns a
+   view of the whole buffer that depends on the previous one, so reading
+   the last sees them all
 9. **Output Normalization & Projection**: RMS norm, then
    `W_out * reservoir_state → vocabulary_logits`
 
@@ -485,6 +487,39 @@ held-out file, and generates at 70 tok/s from a 536 MiB GGUF. The previous
 script had not finished initializing it after 30 minutes. That this barely
 improves on R=8192 shows the ~67k-sample corpus, not the reservoir, is the
 limit at this scale.
+
+### Graph Reuse and Output Stacking
+
+Two inference-side changes, each measured as an A/B on the same machine
+(4-thread CPU, medians of five interleaved `llama-bench -r 3` runs,
+untrained Q4_0 reservoirs at R ≤ 1024 and the trained Q4_0 models from
+the table below at R = 2048 and 8192):
+
+- **Decode graph reuse.** The recurrent-state input never reported that a
+  graph could be reused, so llama.cpp rebuilt and re-allocated the graph
+  for every generated token of every recurrent architecture (Mamba and
+  RWKV as well as ESN). It now allows reuse when the state cells the graph
+  was built for (`head`, `rs_z`, `n_rs`) are unchanged, which is the case
+  for consecutive decode steps.
+- **O(n) output stacking.** Prompt processing stacked the per-token
+  states in a balanced `ggml_concat` tree, copying each state log2(n)
+  times; it now writes each state once (step 8 above).
+
+| R | 256 | 1024 | 2048 | 8192 |
+|---|---:|---:|---:|---:|
+| tg256 (tok/s), rebuild every token → reuse | 16578 → 25732 | 9182 → 11673 | 4437 → 5458 | 597 → 672 |
+| pp512 (tok/s), concat tree → `set_rows` | 66057 → 65988 | 11276 → 14196 | 5807 → 7494 | 729 → 723 |
+
+Both leave the logits bit-identical. Stacking costs nothing measurable when
+the states stay in cache (R = 256) or when reading `W_res` dominates
+(R = 8192).
+
+Batched and token-by-token decoding of the same text take different matmul
+kernels for `W_in`, so their logits differ by rounding (~1e-5 with an F32
+reservoir). With a Q8_0 or Q4_0 reservoir that rounding can flip the
+quantization of one state value, after which the later logits of that
+sequence differ visibly (up to 0.1 relative to the largest logit in one
+`test-esn-inference` sequence).
 
 ### Quantized Reservoirs
 
