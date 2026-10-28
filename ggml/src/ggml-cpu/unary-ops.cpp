@@ -1,5 +1,8 @@
 #include "unary-ops.h"
 
+#include <cstdint>
+#include <cstring>
+
 static inline float op_abs(float x) {
     return fabsf(x);
 }
@@ -16,8 +19,49 @@ static inline float op_step(float x) {
     return (x > 0.f) ? 1.f : 0.f;
 }
 
+// expf without a libm call, so that the loops in tanh and sigmoid below
+// auto-vectorize: x = n*ln2 + r with |r| <= ln2/2, exp(r) by the Cephes
+// polynomial and n added to the exponent bits. Within 1 ulp of exp on the
+// clamped range [-86.6, 88.3], which keeps 2^n a normal float; NaN maps to
+// the lower bound (callers that care propagate it themselves).
+static inline float op_expf_poly(float x) {
+    x = x > -86.6f ? x : -86.6f;
+    x = x <  88.3f ? x :  88.3f;
+    const float n = (x * 1.44269504088896341f + 12582912.0f) - 12582912.0f; // round to nearest
+    const float r = (x - n * 0.693359375f) + n * 2.12194440e-4f;              // x - n*ln2 in two parts
+    float p = 1.9875691500e-4f;
+    p = p * r + 1.3981999507e-3f;
+    p = p * r + 8.3334519073e-3f;
+    p = p * r + 4.1665795894e-2f;
+    p = p * r + 1.6666665459e-1f;
+    p = p * r + 5.0000001201e-1f;
+    p = (p * r) * r + r + 1.0f;
+    int32_t bits;
+    memcpy(&bits, &p, sizeof(bits));
+    bits += (int32_t) n << 23;
+    memcpy(&p, &bits, sizeof(p));
+    return p;
+}
+
+// Branch-free tanh, within 1 ulp like libm's tanhf but vectorizable (scalar
+// tanhf dominates small recurrent graphs, e.g. echo state networks).
+// |x| < 0.625: x*P(x^2), a minimax fit of tanh(x)/x; above it
+// 1 - 2/(exp(2|x|) + 1), whose cancellation is harmless there. |x| is capped
+// at 10, past where tanh rounds to 1.
 static inline float op_tanh(float x) {
-    return tanhf(x);
+    const float ax = fabsf(x);
+    const float a  = ax < 10.0f ? ax : 10.0f;
+    const float a2 = a * a;
+    float q = 2.1286243572831154e-3f;
+    q = q * a2 - 8.15926119685173e-3f;
+    q = q * a2 + 2.169189229607582e-2f;
+    q = q * a2 - 5.394471436738968e-2f;
+    q = q * a2 + 1.3333183526992798e-1f;
+    q = q * a2 - 3.33333283662796e-1f;
+    const float small = (q * a2) * a + a;
+    const float large = 1.0f - 2.0f / (op_expf_poly(2.0f * a) + 1.0f);
+    const float t = copysignf(a < 0.625f ? small : large, x);
+    return x != x ? x : t;
 }
 
 static inline float op_elu(float x) {
@@ -29,7 +73,8 @@ static inline float op_relu(float x) {
 }
 
 static inline float op_sigmoid(float x) {
-    return 1.f / (1.f + expf(-x));
+    const float s = 1.f / (1.f + op_expf_poly(-x));
+    return x != x ? x : s;
 }
 
 static inline float op_hardsigmoid(float x) {

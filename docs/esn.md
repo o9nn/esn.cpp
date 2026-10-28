@@ -73,6 +73,7 @@ training and inference run the same recurrence.
 | `esn_feedback_weights` | `[n_vocab, reservoir_size]` | Output-to-reservoir feedback, one row per token (optional) |
 | `esn_input_bias` | `[reservoir_size]` | Input projection bias (optional) |
 | `esn_reservoir_bias` | `[reservoir_size]` | Reservoir activation bias (optional) |
+| `esn_input_table` | `[n_vocab, reservoir_size]` | Whole input drive of each token, read instead of computing it from the tensors above (optional; see below) |
 
 ## Implementation Details
 
@@ -96,6 +97,10 @@ The ESN forward pass (`llm_build_esn` in `src/llama-model.cpp`) consists of:
    `esn_feedback_weights` is loaded, add `esn_feedback_scaling` times the
    `W_fb` row of each input token (a `get_rows`, done for the whole batch
    before the recurrence because it does not depend on the state)
+
+   With token inputs, steps 1 and 2 depend on the token alone. When the
+   model has `esn_input_table`, its row for each token replaces them (one
+   `get_rows`); embedding inputs still take steps 1 and 2
 3. **State Retrieval**: Get previous reservoir state via
    `llama_memory_recurrent_context::get_s_l(0)` and `build_rs()`
 4. **Recurrent Projection**: `W_res * x(t)`, added to the input drive
@@ -367,10 +372,15 @@ build/bin/test-esn-inference /tmp/esn-smoke.gguf
 Static test coverage (`tests/test-esn.cpp`):
 - Architecture recognition and name mapping
 - Recurrent / hybrid / diffusion classification
-- Tensor info mappings for all 6 ESN tensors (weights + biases + feedback)
+- Tensor info mappings for all 7 ESN tensors (weights + biases + feedback
+  + input table)
 - Hyperparameter defaults (base + extended)
 - Tensor name generation
 - `n_embd_s()` returns `reservoir_size` for ESN models
+
+Activation accuracy (`tests/test-esn-activations.cpp`, a CTest): the CPU
+backend's `tanh` and `sigmoid` against double-precision references, special
+values, and multi-row / multi-thread consistency.
 
 End-to-end inference coverage (`tests/test-esn-inference.cpp`):
 - GGUF metadata & tensor-shape loading for `arch=esn`
@@ -411,6 +421,7 @@ python scripts/esn_training.py --init-only --reservoir-size 2048 --output untrai
 | Validation split | `--val-fraction` | 0.1 | Sequences held out to pick lambda and fit the temperature |
 | Lambda search | `--reg-grid` | (off) | Comma-separated lambdas, chosen by held-out NLL |
 | No calibration | `--no-calibrate` | (off) | Export raw ridge outputs as logits |
+| No input table | `--no-input-table` | (off) | Do not store `esn_input_table` (`n_vocab * reservoir_size` floats; inference then computes the input drive) |
 | Reservoir type | `--outtype` | `f32` | `f16`, `q8_0` or `q4_0` (16, 8.5 or 4.5 bits per weight) shrink the reservoir and its per-token read; the quantized types need a reservoir size that is a multiple of 32 |
 
 ### Training Process
@@ -514,12 +525,53 @@ Both leave the logits bit-identical. Stacking costs nothing measurable when
 the states stay in cache (R = 256) or when reading `W_res` dominates
 (R = 8192).
 
-Batched and token-by-token decoding of the same text take different matmul
-kernels for `W_in`, so their logits differ by rounding (~1e-5 with an F32
+Without an input table, batched and token-by-token decoding of the same
+text take different matmul kernels for `W_in`, so their logits differ by rounding (~1e-5 with an F32
 reservoir). With a Q8_0 or Q4_0 reservoir that rounding can flip the
 quantization of one state value, after which the later logits of that
 sequence differ visibly (up to 0.1 relative to the largest logit in one
 `test-esn-inference` sequence).
+
+### Vectorized Activations and the Input Table
+
+At small and medium reservoirs, a token's time went mostly to two things
+other than reading `W_res`:
+
+- **The activation.** The CPU backend computed `tanh` with libm's scalar
+  `tanhf`, about 20 ns per element here: at R = 1024 it was 14 % of the
+  single-thread instructions, more than everything but the `W_res` matvec.
+  A state is one row, so the op also ran on one thread while the others
+  waited. `tanh` and `sigmoid` in `ggml/src/ggml-cpu/unary-ops.cpp` are now
+  branch-free (a minimax polynomial below |x| = 0.625, an inline `exp`
+  above), so the compiler vectorizes them: 0.8 ns per element with AVX2,
+  within 1.2 ulp of `tanh` and 2 ulp of the logistic function
+  (`tests/test-esn-activations.cpp`), like libm's. This applies to every
+  model that uses `ggml_tanh` or `ggml_sigmoid` on the CPU.
+- **Graph nodes.** A decode step is a short chain of small ops, and each
+  op ends with a barrier across threads. The input drive took up to seven
+  of them (projection, scale, two bias adds, feedback lookup, scale, add)
+  although it depends on the token alone; `scripts/esn_training.py` now
+  stores it per token as `esn_input_table` (`--no-input-table` to omit it),
+  and the graph reads it with one `get_rows`. A scale by 1 is also no
+  longer emitted. For the default 256-token byte vocabulary the table adds
+  1 KiB per reservoir unit to the GGUF (+60 % at R = 256 Q4_0, +11 % at
+  R = 2048 F32).
+
+Before (libm `tanhf`, no table) → after, on the same machine (4-thread CPU,
+medians of eight interleaved `llama-bench -r 3` runs; `--use-bias
+--leaking-rate 0.5` reservoirs, Q4_0 at R ≤ 1024, F32 at R = 2048, and the
+R = 8192 Q4_0 model of the next table without a table):
+
+| R | 256 | 1024 | 2048 | 8192 |
+|---|---:|---:|---:|---:|
+| pp512 (tok/s) | 64846 → 123743 | 20361 → 37590 | 4784 → 6000 | 893 → 970 |
+| tg256 (tok/s) | 25659 → 32764 | 11956 → 18560 | 3470 → 4440 | 766 → 852 |
+
+Most of this is the activation (pp512 +64 % and tg256 +27 % at R = 1024
+from it alone); the table adds 16-18 % to R = 1024 decoding and is within
+this machine's noise at R = 256. Logits move by rounding only (≤ 1.1e-6
+relative to the largest logit for F32 reservoirs; held-out perplexity and
+the C++/Python parity are unchanged).
 
 ### Quantized Reservoirs
 

@@ -415,6 +415,16 @@ class ESN:
             drive += self.config.feedback_scaling * self.W_fb[tokens]
         return drive
 
+    def input_table(self) -> np.ndarray:
+        """
+        The input drive of every token, [vocab_size, reservoir_size].
+
+        With token inputs, _input_drive depends on the token alone, so
+        save_gguf stores it per token and llm_build_esn reads each token's
+        drive with one row lookup instead of computing it.
+        """
+        return self._input_drive(self.tok_embd.T, np.arange(self.config.vocab_size))
+
     def forward(
         self,
         embeddings: np.ndarray,
@@ -851,7 +861,7 @@ class ESN:
             "final_state": state.copy(),
         }
 
-    def save_gguf(self, path: str) -> None:
+    def save_gguf(self, path: str, input_table: bool = True) -> None:
         """
         Save the ESN model as a GGUF file compatible with esn.cpp's
         ``llm_build_esn`` graph builder.
@@ -880,6 +890,8 @@ class ESN:
           - ``esn_feedback_weights.weight``  [reservoir_size, n_vocab] (optional)
           - ``esn_input_bias.weight``        (optional)
           - ``esn_reservoir_bias.weight``    (optional)
+          - ``esn_input_table.weight``       [reservoir_size, n_vocab]
+            (unless input_table=False; see input_table())
         """
         if not self._initialized:
             raise RuntimeError("ESN not initialized. Call initialize() first.")
@@ -960,6 +972,8 @@ class ESN:
         #       -> numpy (n_vocab, reservoir)     [matches training layout]
         #   esn_input_bias.weight        C++ {reservoir}                  [1-D]
         #   esn_reservoir_bias.weight    C++ {reservoir}                  [1-D]
+        #   esn_input_table.weight       C++ {reservoir, n_vocab}
+        #       -> numpy (n_vocab, reservoir)
         def _f32(x: np.ndarray) -> np.ndarray:
             return np.ascontiguousarray(x, dtype=np.float32)
 
@@ -983,6 +997,10 @@ class ESN:
             writer.add_tensor("esn_input_bias.weight",       _f32(self.b_in))
         if self.b_res is not None:
             writer.add_tensor("esn_reservoir_bias.weight",   _f32(self.b_res))
+        if input_table:
+            # Read instead of W_in, the biases and W_fb for token inputs; those
+            # stay in the file for embedding inputs.
+            writer.add_tensor("esn_input_table.weight",      _f32(self.input_table()))
 
         writer.write_header_to_file()
         writer.write_kv_data_to_file()
@@ -1189,6 +1207,10 @@ Examples:
                              "(picked by held-out NLL); default: --regularization only")
     parser.add_argument("--no-calibrate", action="store_true",
                         help="Do not fit a softmax temperature (export raw ridge outputs as logits)")
+    parser.add_argument("--no-input-table", action="store_true",
+                        help="Do not store the per-token input drive (vocab_size x "
+                             "reservoir_size floats) that inference reads instead of "
+                             "computing it")
     parser.add_argument("--outtype", choices=list(RESERVOIR_TYPES), default="f32",
                         help="Storage type of the reservoir matrix in the GGUF. The readout "
                              "is trained on the rounded reservoir; q8_0 and q4_0 need a "
@@ -1352,7 +1374,7 @@ Examples:
             logger.info(f"Final training accuracy: {accuracy:.4f}")
 
     # Save to GGUF
-    esn.save_gguf(args.output)
+    esn.save_gguf(args.output, input_table=not args.no_input_table)
     logger.info(f"\nModel saved to {args.output}")
     logger.info("\nTo use with llama.cpp:")
     logger.info(f"  ./llama-cli -m {args.output} -p \"Your prompt here\"")

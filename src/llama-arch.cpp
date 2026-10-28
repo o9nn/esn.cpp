@@ -2184,6 +2184,7 @@ static const std::map<llm_arch, std::map<llm_tensor, const char *>> LLM_TENSOR_N
             { LLM_TENSOR_ESN_FEEDBACK_WEIGHTS,    "esn_feedback_weights" },
             { LLM_TENSOR_ESN_INPUT_BIAS,          "esn_input_bias" },
             { LLM_TENSOR_ESN_RESERVOIR_BIAS,      "esn_reservoir_bias" },
+            { LLM_TENSOR_ESN_INPUT_TABLE,         "esn_input_table" },
         },
     },
     {
@@ -2476,6 +2477,7 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
     {LLM_TENSOR_ESN_FEEDBACK_WEIGHTS,       {LLM_TENSOR_LAYER_INPUT,  GGML_OP_GET_ROWS}},
     {LLM_TENSOR_ESN_INPUT_BIAS,             {LLM_TENSOR_LAYER_INPUT,  GGML_OP_ADD}},
     {LLM_TENSOR_ESN_RESERVOIR_BIAS,         {LLM_TENSOR_LAYER_INPUT,  GGML_OP_ADD}},
+    {LLM_TENSOR_ESN_INPUT_TABLE,            {LLM_TENSOR_LAYER_INPUT,  GGML_OP_GET_ROWS}},
 };
 
 LLM_KV::LLM_KV(llm_arch arch, const char * suffix) : arch(arch), suffix(suffix) {}
