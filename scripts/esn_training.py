@@ -1240,6 +1240,12 @@ Examples:
     if not args.init_only and not args.train_data:
         parser.error("--train-data is required to train the readout "
                      "(use --init-only to write untrained random weights)")
+    if args.save_online_metadata and args.init_only and not (args.online and args.online_mode == "sgd"):
+        # the runtime ridge/RLS updates fit W_out x to T * one-hot, and an
+        # untrained readout has no scale T (esn.output_temperature) to use
+        parser.error("--save-online-metadata with --init-only selects a least-squares runtime update, "
+                     "which needs the scale a trained readout was fit to; train the readout "
+                     "(--train-data) or choose SGD (--online --online-mode sgd)")
     if not (0.0 < args.forgetting_factor <= 1.0):
         parser.error("--forgetting-factor must be in (0, 1]")
     if args.bidirectional:

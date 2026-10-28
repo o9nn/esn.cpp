@@ -695,10 +695,25 @@ readout without the key (SGD-trained or untrained) can only be adapted with
 SGD. Corrections and tool results are samples of weight 1; rewards weight
 the emitted token by the reward (negative only with SGD); confidence
 weights it by a value in [0, 1]. Latency events are rejected: they carry
-no token target. A readout stored repacked for the CPU kernels cannot be
-read back; load such models with `use_extra_bufts = false` (`--no-repack`).
+no token target. A readout stored in one of the CPU's extra buffer types
+(REPACK, AMX) cannot be read back; load such models with
+`use_extra_bufts = false` (`--no-repack`).
 The adapted readout is not included in `llama_state_*` data.
-`tests/test-esn-online.cpp` checks each mode against its closed form.
+
+Recordings follow the sequence: decoding a position again (after
+`llama_memory_seq_rm` or a memory clear) discards what was recorded at and
+after it, even when the new tokens produce no logits, and feedback is
+refused (-3) for positions past the newest one the context's memory holds.
+A batch of feedback that would overflow `esn.online_learning.buf_size` is
+refused (-5) before anything is copied. If a least-squares solve is
+numerically singular (λ below the rounding of `Σ w x xᵀ`), the update
+returns -9 and leaves the readout and the pending samples as they were;
+raise `regularization`. A LoRA on `esn_output_weights` and an adapted
+readout exclude each other: the update returns -10 while such an adapter
+is set, and `llama_set_adapter_lora` returns -1 for one while the readout
+is adapted (`llama_esn_reset_adaptation` lifts it).
+`tests/test-esn-online.cpp` checks each mode against its closed form, and
+the rewind, singular-solve and LoRA rules.
 
 **Proprioceptive feedback**: Signals originating from the model's own execution context:
 - `CORRECTION` — explicit user or verifier correction

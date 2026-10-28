@@ -60,6 +60,9 @@ struct llama_context {
     // with esn.online_learning.enabled
     llama_esn_adapter * get_esn() const;
 
+    // true if a LoRA adapter on this context modifies the model's readout
+    bool lora_adapts_readout() const;
+
     // return true if the memory was updated
     bool memory_update(bool optimize);
 
@@ -86,7 +89,8 @@ struct llama_context {
     void set_causal_attn(bool value);
     void set_warmup(bool value);
 
-    void set_adapter_lora(
+    // false if the adapter modifies an ESN readout that is currently adapted
+    bool set_adapter_lora(
             llama_adapter_lora * adapter,
             float scale);
 

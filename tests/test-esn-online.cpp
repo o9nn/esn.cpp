@@ -31,6 +31,7 @@
 
 #include "llama.h"
 #include "ggml.h"
+#include "ggml-backend.h"
 #include "gguf.h"
 
 #include <algorithm>
@@ -110,6 +111,31 @@ static void write_model(const std::string & path, bool online) {
     ggml_free(ctx);
 }
 
+// A rank-1 LoRA on the readout.
+static void write_readout_lora(const std::string & path) {
+    gguf_context * g = gguf_init_empty();
+    gguf_set_val_str(g, "general.type", "adapter");
+    gguf_set_val_str(g, "general.architecture", "esn");
+    gguf_set_val_str(g, "adapter.type", "lora");
+    gguf_set_val_f32(g, "adapter.lora.alpha", 1.0f);
+
+    ggml_init_params ip = { 4 * ggml_tensor_overhead() + 4 * (N_RES + N_VOCAB) + 1024, nullptr, false };
+    ggml_context * ctx = ggml_init(ip);
+    ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, N_RES, 1);
+    ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, N_VOCAB);
+    ggml_set_name(a, "esn_output_weights.weight.lora_a");
+    ggml_set_name(b, "esn_output_weights.weight.lora_b");
+    for (int64_t i = 0; i < ggml_nelements(a); ++i) { ((float *) a->data)[i] = 0.01f; }
+    for (int64_t i = 0; i < ggml_nelements(b); ++i) { ((float *) b->data)[i] = 0.01f * (float) (i % 7); }
+    gguf_add_tensor(g, a);
+    gguf_add_tensor(g, b);
+
+    const bool ok = gguf_write_to_file(g, path.c_str(), false);
+    assert(ok);
+    gguf_free(g);
+    ggml_free(ctx);
+}
+
 static llama_context * make_ctx(llama_model * model) {
     llama_context_params cp = llama_context_default_params();
     cp.n_ctx    = 128;
@@ -175,8 +201,12 @@ static float max_abs_diff(const std::vector<float> & a, const std::vector<float>
 }
 
 int main(int argc, char ** argv) {
-    llama_log_set(silent_log, nullptr);
+    if (getenv("ESN_TEST_LOG") == nullptr) {
+        llama_log_set(silent_log, nullptr);
+    }
     llama_backend_init();
+    // a GGML_BACKEND_DL build registers no backend until it is loaded
+    ggml_backend_load_all();
 
     const bool synthetic = argc < 2;
     const auto dir = std::filesystem::temp_directory_path();
@@ -383,6 +413,91 @@ int main(int argc, char ** argv) {
         printf("  H  the feedback buffer is bounded: ok\n");
     }
 
+    // I: recordings follow the sequence as it is rewound or cleared
+    llama_esn_reset_adaptation(ctx);
+    {
+        llama_esn_online_params p = mode_params(0);
+        decode_all(ctx, prompt);
+
+        // a clear with nothing decoded after it: every position is gone
+        llama_memory_clear(llama_get_memory(ctx), true);
+        llama_esn_feedback_event ev = event(LLAMA_ESN_FEEDBACK_CORRECTION, at, &target);
+        assert(llama_esn_submit_feedback(ctx, &ev, 1) == -3);
+
+        // re-decoded with an output only at the last position: the earlier
+        // positions were decoded again, so their old recordings are stale
+        llama_batch b = llama_batch_init((int32_t) prompt.size(), 0, 1);
+        for (size_t i = 0; i < prompt.size(); ++i) {
+            b.token[i] = prompt[prompt.size() - 1 - i];
+            b.pos[i] = (llama_pos) i;
+            b.n_seq_id[i] = 1;
+            b.seq_id[i][0] = 0;
+            b.logits[i] = i + 1 == prompt.size();
+        }
+        b.n_tokens = (int32_t) prompt.size();
+        assert(llama_decode(ctx, b) == 0);
+        llama_batch_free(b);
+        assert(llama_esn_submit_feedback(ctx, &ev, 1) == -3);
+        llama_esn_feedback_event last = event(LLAMA_ESN_FEEDBACK_CORRECTION, (llama_pos) prompt.size() - 1, &target);
+        assert(llama_esn_submit_feedback(ctx, &last, 1) == 0);
+        assert(llama_esn_update_readout(ctx, &p) == 1);
+        llama_esn_reset_adaptation(ctx);
+        printf("  I  rewound and cleared positions cannot be trained on: ok\n");
+    }
+
+    // J: a singular solve fails without changing anything
+    {
+        decode_all(ctx, prompt);
+        llama_esn_feedback_event ev = event(LLAMA_ESN_FEEDBACK_CORRECTION, at, &target);
+        llama_esn_feedback_event twice[2] = { ev, ev };
+        assert(llama_esn_submit_feedback(ctx, twice, 2) == 0);
+        for (uint32_t mode : { 0u, 1u }) {
+            // two identical samples: lambda below the rounding of |x|^2 leaves
+            // the second pivot at zero
+            llama_esn_online_params tiny = mode_params(mode, 0.0f, 1e-30f);
+            const int32_t rc = llama_esn_update_readout(ctx, &tiny);
+            assert(rc == -9 || (mode == 1 && rc == 2));
+            if (rc == 2) {
+                // RLS stays stable here; start over for the ridge check
+                llama_esn_reset_adaptation(ctx);
+                assert(llama_esn_submit_feedback(ctx, twice, 2) == 0);
+                continue;
+            }
+            assert(max_abs_diff(decode_all(ctx, prompt)[at], base[at]) == 0.0f);
+        }
+        llama_esn_online_params p = mode_params(0, 0.0f, 1e-4f);
+        assert(llama_esn_update_readout(ctx, &p) == 2);           // the samples were kept
+        llama_esn_reset_adaptation(ctx);
+        printf("  J  a singular least-squares solve is refused and changes nothing: ok\n");
+    }
+
+    // K: a LoRA on the readout and an adapted readout exclude each other
+    if (synthetic) {
+        const std::string path_lora = (dir / "test-esn-online-lora.gguf").string();
+        write_readout_lora(path_lora);
+        llama_adapter_lora * lora = llama_adapter_lora_init(model, path_lora.c_str());
+        assert(lora != nullptr);
+
+        decode_all(ctx, prompt);
+        llama_esn_feedback_event ev = event(LLAMA_ESN_FEEDBACK_CORRECTION, at, &target);
+        llama_esn_online_params p = mode_params(0);
+        assert(llama_set_adapter_lora(ctx, lora, 1.0f) == 0);
+        const auto with_lora = decode_all(ctx, prompt);
+        assert(max_abs_diff(with_lora[at], base[at]) > 0.0f);     // the LoRA applies
+        assert(llama_esn_submit_feedback(ctx, &ev, 1) == 0);
+        assert(llama_esn_update_readout(ctx, &p) == -10);
+        assert(llama_rm_adapter_lora(ctx, lora) == 0);
+        assert(llama_esn_update_readout(ctx, &p) == 1);
+        assert(llama_set_adapter_lora(ctx, lora, 1.0f) == -1);   // refused while adapted
+        llama_esn_reset_adaptation(ctx);
+        assert(llama_set_adapter_lora(ctx, lora, 1.0f) == 0);
+        assert(llama_rm_adapter_lora(ctx, lora) == 0);
+
+        llama_adapter_lora_free(lora);
+        std::filesystem::remove(path_lora);
+        printf("  K  a readout LoRA and online adaptation are mutually exclusive: ok\n");
+    }
+
     llama_free(ctx);
     llama_free(ctx2);
     llama_model_free(model);
@@ -393,6 +508,6 @@ int main(int argc, char ** argv) {
     std::filesystem::remove(path_off);
     llama_backend_free();
 
-    printf("test-esn-online: PASSED (A..H)\n");
+    printf("test-esn-online: PASSED (A..K)\n");
     return 0;
 }

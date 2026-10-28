@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <map>
 #include <vector>
 
@@ -36,11 +37,16 @@ struct llama_esn_adapter {
     explicit llama_esn_adapter(const llama_model & model);
     ~llama_esn_adapter();
 
-    // Record the readout inputs of one ubatch. `rows` holds n_outputs
-    // vectors of reservoir_size floats, in ubatch output order.
+    // Record the readout inputs of one ubatch, which is called for every
+    // ubatch, with or without outputs: each decoded position invalidates what
+    // was recorded at or after it. `rows` holds n_outputs vectors of
+    // reservoir_size floats, in ubatch output order.
     void capture(const llama_ubatch & ubatch, uint32_t n_outputs, const float * rows);
 
-    int32_t submit (const llama_esn_feedback_event * events, int32_t n_events);
+    // `pos_max(seq)` is the newest position the context's memory holds for
+    // seq; positions after it were cleared and cannot be trained on
+    int32_t submit(const llama_esn_feedback_event * events, int32_t n_events,
+                   const std::function<llama_pos(llama_seq_id)> & pos_max);
     int32_t update (const llama_esn_online_params & params, int n_threads);
     void    reset();
 
@@ -95,7 +101,8 @@ private:
     void   ensure_readout();
     float * w_data() const;
 
-    void update_ridge(float lambda, float decay, uint32_t window, float temperature, int n_threads);
-    void update_rls  (float lambda, float decay, float temperature);
+    // false: the solve was numerically singular and nothing was changed
+    bool update_ridge(float lambda, float decay, uint32_t window, float temperature, int n_threads);
+    bool update_rls  (float lambda, float decay, float temperature);
     void update_sgd  (float lr, float reg);
 };

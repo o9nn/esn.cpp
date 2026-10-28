@@ -572,6 +572,13 @@ extern "C" {
     //   -6 a least-squares mode needs esn.output_temperature, which the model lacks
     //   -7 a least-squares mode was given samples with negative weight
     //   -8 the readout could not be read or allocated (see the log)
+    //   -9 the least-squares solve was numerically singular; raise regularization
+    //  -10 a LoRA adapter on the context modifies the readout
+    //
+    // Positions are tracked per sequence: decoding a position again (after
+    // llama_memory_seq_rm or a memory clear) discards what was recorded at
+    // and after it, and feedback is refused for positions past the newest one
+    // the context's memory holds.
     //
 
     enum llama_esn_feedback_type {
@@ -630,7 +637,8 @@ extern "C" {
     // events are validated first; on error none is added.
     // Returns 0 on success; -3 for an unknown or LATENCY type, missing or
     // out-of-range targets, a non-finite reward, a confidence outside [0, 1],
-    // or a position with no recorded readout input; -1, -2, -4, -5.
+    // or a position with no recorded readout input; -5 if the batch would
+    // overflow the feedback buffer; -1, -2, -4.
     LLAMA_API int32_t llama_esn_submit_feedback(
             struct llama_context *                  ctx,
             const struct llama_esn_feedback_event * events,
@@ -641,7 +649,7 @@ extern "C" {
     // T = esn.output_temperature, the scale the exported readout was fit to.
     // Returns the number of events consumed (0 if none were pending or
     // params->enabled is false); -3 for invalid params; -1, -2, -4, -6, -7,
-    // -8. On error the pending samples are kept.
+    // -8, -9, -10. On error the readout and the pending samples are unchanged.
     LLAMA_API int32_t llama_esn_update_readout(
             struct llama_context *              ctx,
             const struct llama_esn_online_params * params);
@@ -702,6 +710,8 @@ extern "C" {
 
     // Add a loaded LoRA adapter to given context
     // This will not modify model's weight
+    // Returns -1 if the adapter modifies an ESN readout the context has
+    // adapted online (see llama_esn_reset_adaptation), 0 otherwise
     LLAMA_API int32_t llama_set_adapter_lora(
             struct llama_context * ctx,
             struct llama_adapter_lora * adapter,

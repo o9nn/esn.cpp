@@ -80,20 +80,21 @@ llama_esn_adapter::~llama_esn_adapter() = default;
 
 void llama_esn_adapter::capture(const llama_ubatch & ubatch, uint32_t n_outputs, const float * rows) {
     uint32_t j = 0;
-    for (uint32_t i = 0; i < ubatch.n_tokens && j < n_outputs; ++i) {
-        if (n_outputs != ubatch.n_tokens && !ubatch.output[i]) {
-            continue;
-        }
-        const float * x = rows + (size_t) j * n_res;
-        ++j;
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        const bool is_output = n_outputs == ubatch.n_tokens || (n_outputs > 0 && ubatch.output[i]);
+        const float * x = is_output ? rows + (size_t) j++ * n_res : nullptr;
         const llama_pos pos = ubatch.pos[i];
         for (int32_t s = 0; s < ubatch.n_seq_id[i]; ++s) {
             auto & q = recorded[ubatch.seq_id[i][s]];
-            // a position at or before the newest one means the sequence was
-            // rewound (seq_rm, memory clear): what was recorded from there on
-            // belongs to tokens that are gone
+            // decoding a position at or before the newest recorded one means
+            // the sequence was rewound (seq_rm, memory clear): what was
+            // recorded from there on belongs to tokens that are gone, whether
+            // or not this token produces an output
             while (!q.empty() && q.back().pos >= pos) {
                 q.pop_back();
+            }
+            if (x == nullptr) {
+                continue;
             }
             q.push_back({ pos, std::vector<float>(x, x + n_res) });
             while (q.size() > recorded_cap) {
@@ -101,6 +102,7 @@ void llama_esn_adapter::capture(const llama_ubatch & ubatch, uint32_t n_outputs,
             }
         }
     }
+    GGML_ASSERT(j == n_outputs);
 }
 
 const llama_esn_adapter::captured * llama_esn_adapter::find(llama_seq_id seq, llama_pos pos) const {
@@ -114,7 +116,8 @@ const llama_esn_adapter::captured * llama_esn_adapter::find(llama_seq_id seq, ll
     return c != q.end() && c->pos == pos ? &*c : nullptr;
 }
 
-int32_t llama_esn_adapter::submit(const llama_esn_feedback_event * events, int32_t n_events) {
+int32_t llama_esn_adapter::submit(const llama_esn_feedback_event * events, int32_t n_events,
+                                  const std::function<llama_pos(llama_seq_id)> & pos_max) {
     if (n_events < 0 || (n_events > 0 && events == nullptr)) {
         return -3;
     }
@@ -164,21 +167,22 @@ int32_t llama_esn_adapter::submit(const llama_esn_feedback_event * events, int32
                 LLAMA_LOG_ERROR("%s: event %d: target token %d is out of range\n", __func__, e, tok);
                 return -3;
             }
-            const captured * c = find(ev.seq_id, ev.pos + k);
+            const captured * c = ev.pos + k <= pos_max(ev.seq_id) ? find(ev.seq_id, ev.pos + k) : nullptr;
             if (c == nullptr) {
                 LLAMA_LOG_ERROR("%s: event %d: no readout input recorded for seq %d pos %d (the position "
-                        "was not decoded with an output, was rewound, or is older than the last %zu)\n",
+                        "was not decoded with an output, was rewound or cleared, or is older than the last %zu)\n",
                         __func__, e, ev.seq_id, ev.pos + k, recorded_cap);
                 return -3;
             }
+            // checked before each copy, so an oversized batch fails before
+            // it allocates more than the buffer could hold
+            if (pending.size() + fresh.size() >= pending_cap) {
+                LLAMA_LOG_ERROR("%s: event %d: the batch exceeds the feedback buffer (%zu pending of %zu); "
+                        "call llama_esn_update_readout first\n", __func__, e, pending.size(), pending_cap);
+                return -5;
+            }
             fresh.push_back({ c->x, tok, weight });
         }
-    }
-
-    if (pending.size() + fresh.size() > pending_cap) {
-        LLAMA_LOG_ERROR("%s: %zu samples would exceed the feedback buffer (%zu pending of %zu); "
-                "call llama_esn_update_readout first\n", __func__, fresh.size(), pending.size(), pending_cap);
-        return -5;
     }
 
     for (auto & s : fresh) {
@@ -198,12 +202,29 @@ void llama_esn_adapter::ensure_readout() {
         return;
     }
 
+    ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    if (cpu == nullptr) {
+        throw std::runtime_error("ESN: online adaptation needs the CPU backend");
+    }
+
     // the checkpoint, dequantized
     const ggml_tensor * out = model.output;
-    // weights repacked for the CPU matmul kernels cannot be read back
-    if (out->buffer && strstr(ggml_backend_buft_name(ggml_backend_buffer_get_type(out->buffer)), "REPACK") != nullptr) {
-        throw std::runtime_error("ESN: the readout is stored repacked for the CPU kernels and cannot be read back; "
-                "load the model with use_extra_bufts = false (--no-repack) to adapt it");
+    if (out->buffer == nullptr) {
+        throw std::runtime_error("ESN: the readout has no data");
+    }
+    // the CPU's extra buffer types (REPACK, AMX, ...) hold weights in kernel
+    // layouts and some cannot be read back at all
+    {
+        const ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(out->buffer);
+        auto * get_extra = (ggml_backend_dev_get_extra_bufts_t)
+            ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(cpu), "ggml_backend_dev_get_extra_bufts");
+        for (ggml_backend_buffer_type_t * e = get_extra ? get_extra(cpu) : nullptr; e && *e; ++e) {
+            if (*e == buft) {
+                throw std::runtime_error(std::string("ESN: the readout is stored in the ") + ggml_backend_buft_name(buft) +
+                        " buffer for the CPU kernels and cannot be read back; load the model with "
+                        "use_extra_bufts = false (--no-repack) to adapt it");
+            }
+        }
     }
     std::vector<uint8_t> raw(ggml_nbytes(out));
     ggml_backend_tensor_get(out, raw.data(), 0, raw.size());
@@ -222,26 +243,30 @@ void llama_esn_adapter::ensure_readout() {
         }
     }
 
+    // built in locals and committed only once fully allocated, so a failure
+    // leaves the adapter as it was and a later update can retry
     ggml_init_params params = {
         /*.mem_size   =*/ ggml_tensor_overhead(),
         /*.mem_buffer =*/ nullptr,
         /*.no_alloc   =*/ true,
     };
-    ctx_w.reset(ggml_init(params));
-    w = ggml_new_tensor_2d(ctx_w.get(), GGML_TYPE_F32, n_res, n_vocab);
-    ggml_set_name(w, "esn_adapted_readout");
-
-    ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
-    if (cpu == nullptr) {
-        throw std::runtime_error("ESN: online adaptation needs the CPU backend");
+    ggml_context_ptr ctx(ggml_init(params));
+    if (!ctx) {
+        throw std::runtime_error("ESN: failed to create the adapted readout");
     }
-    buf_w.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_w.get(), ggml_backend_dev_buffer_type(cpu)));
-    if (!buf_w) {
+    ggml_tensor * t = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, n_res, n_vocab);
+    ggml_set_name(t, "esn_adapted_readout");
+
+    ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), ggml_backend_dev_buffer_type(cpu)));
+    if (!buf) {
         throw std::runtime_error("ESN: failed to allocate the adapted readout");
     }
-    GGML_ASSERT(ggml_backend_buffer_is_host(buf_w.get()));
+    GGML_ASSERT(ggml_backend_buffer_is_host(buf.get()));
+    memcpy(t->data, w0.data(), w0.size() * sizeof(float));
 
-    memcpy(w_data(), w0.data(), w0.size() * sizeof(float));
+    ctx_w = std::move(ctx);
+    buf_w = std::move(buf);
+    w     = t;
 }
 
 int32_t llama_esn_adapter::update(const llama_esn_online_params & p, int n_threads) {
@@ -286,10 +311,17 @@ int32_t llama_esn_adapter::update(const llama_esn_online_params & p, int n_threa
 
     ensure_readout();
 
+    bool ok = true;
     switch (p.update_mode) {
-        case 0: update_ridge(p.regularization, p.decay_rate, p.replay_window, temperature, n_threads); break;
-        case 1: update_rls  (p.regularization, p.decay_rate, temperature);                           break;
-        case 2: update_sgd  (p.learning_rate, p.regularization);                                     break;
+        case 0: ok = update_ridge(p.regularization, p.decay_rate, p.replay_window, temperature, n_threads); break;
+        case 1: ok = update_rls  (p.regularization, p.decay_rate, temperature);                           break;
+        case 2:      update_sgd  (p.learning_rate, p.regularization);                                     break;
+    }
+    if (!ok) {
+        LLAMA_LOG_ERROR("%s: the %s solve is numerically singular at regularization %g; the readout and the "
+                "pending feedback are unchanged (raise the regularization)\n", __func__,
+                p.update_mode == 0 ? "ridge" : "RLS", p.regularization);
+        return -9;
     }
     last_mode = (int) p.update_mode;
     active    = true;
@@ -307,7 +339,7 @@ int32_t llama_esn_adapter::update(const llama_esn_online_params & p, int n_threa
     return consumed;
 }
 
-void llama_esn_adapter::update_ridge(float lambda, float decay, uint32_t window, float temperature, int n_threads) {
+bool llama_esn_adapter::update_ridge(float lambda, float decay, uint32_t window, float temperature, int n_threads) {
     // the newest `window` samples of history + pending
     std::vector<const sample *> set;
     for (const auto & s : history) {
@@ -346,11 +378,17 @@ void llama_esn_adapter::update_ridge(float lambda, float decay, uint32_t window,
         }
     }
     for (int64_t j = 0; j < n; ++j) {
-        double d = G[j * n + j];
+        const double diag = G[j * n + j];
+        double d = diag;
         for (int64_t k = 0; k < j; ++k) {
             d -= G[j * n + k] * G[j * n + k];
         }
-        GGML_ASSERT(d > 0.0);
+        // lambda > 0 makes G positive definite in exact arithmetic, but a
+        // lambda below the rounding of S S^T leaves a pivot that is only
+        // rounding noise: treat pivots under 1e-12 of their diagonal as zero
+        if (!(d > 1e-12 * diag) || !std::isfinite(d)) {
+            return false;
+        }
         d = std::sqrt(d);
         G[j * n + j] = d;
         for (int64_t i = j + 1; i < n; ++i) {
@@ -394,10 +432,23 @@ void llama_esn_adapter::update_ridge(float lambda, float decay, uint32_t window,
             }
         }
     });
+    return true;
 }
 
-void llama_esn_adapter::update_rls(float lambda, float decay, float temperature) {
+bool llama_esn_adapter::update_rls(float lambda, float decay, float temperature) {
     const int64_t R = n_res;
+
+    // restored if a step loses positive definiteness, so a failed update
+    // changes nothing
+    std::vector<float>  w_saved(w_data(), w_data() + (size_t) n_vocab * R);
+    std::vector<double> p_saved = rls_p;
+    const float lambda_saved = rls_lambda;
+    const auto rollback = [&]() {
+        memcpy(w_data(), w_saved.data(), w_saved.size() * sizeof(float));
+        rls_p      = std::move(p_saved);
+        rls_lambda = lambda_saved;
+        return false;
+    };
 
     // P is the inverse of lambda I + sum w x x^T for samples since the last
     // restart; it restarts at I / lambda (a prior centered on the current
@@ -432,6 +483,10 @@ void llama_esn_adapter::update_rls(float lambda, float decay, float temperature)
             xg  += acc * x[i];
         }
         const double denom = f / s.weight + xg;
+        // P is positive definite, so xg >= 0; anything else is rounding loss
+        if (!(xg >= 0.0) || !std::isfinite(denom)) {
+            return rollback();
+        }
         for (int64_t i = 0; i < R; ++i) {
             k[i] = (float) (g[i] / denom);
         }
@@ -450,6 +505,7 @@ void llama_esn_adapter::update_rls(float lambda, float decay, float temperature)
             }
         }
     }
+    return true;
 }
 
 void llama_esn_adapter::update_sgd(float lr, float reg) {
@@ -572,7 +628,10 @@ int32_t llama_esn_submit_feedback(
     if (const int32_t rc = llama_esn_check(ctx); rc != 0) {
         return rc;
     }
-    return ctx->get_esn()->submit(events, n_events);
+    const llama_memory_t mem = ctx->get_memory();
+    return ctx->get_esn()->submit(events, n_events, [mem](llama_seq_id seq) {
+        return mem ? mem->seq_pos_max(seq) : (llama_pos) -1;
+    });
 }
 
 int32_t llama_esn_update_readout(
@@ -586,6 +645,11 @@ int32_t llama_esn_update_readout(
     }
     if (params == nullptr) {
         return -3;
+    }
+    if (params->enabled && ctx->lora_adapts_readout()) {
+        LLAMA_LOG_ERROR("%s: a LoRA adapter on this context modifies the readout; the adapted readout would "
+                "replace it, so remove the adapter (llama_rm_adapter_lora) before adapting\n", __func__);
+        return -10;
     }
     // no graph may be reading the readout while it changes
     ctx->synchronize();
