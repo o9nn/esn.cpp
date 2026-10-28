@@ -50,6 +50,7 @@ esn_output_weights.weight     [n_vocab, reservoir_size]
 esn_feedback_weights.weight   [n_vocab, reservoir_size]  (optional, row per fed-back token)
 esn_input_bias.weight         [reservoir_size]           (optional)
 esn_reservoir_bias.weight     [reservoir_size]           (optional)
+esn_input_table.weight        [n_vocab, reservoir_size]  (optional, input drive per token)
 ```
 
 ## Build Commands
@@ -124,6 +125,11 @@ python scripts/esn_training.py --init-only --output untrained.gguf
 python scripts/esn_training.py --reservoir-size 8192 --reg-grid 1,10,100,1000 \
     --outtype q4_0 --train-data corpus.txt --output model.gguf
 ```
+
+`esn_training.py` stores each token's whole input drive as `esn_input_table`
+(`--no-input-table` to omit it); with token inputs the graph reads it instead
+of computing W_in·E + biases + feedback. The CPU `tanh`/`sigmoid` are
+branch-free so they vectorize (`tests/test-esn-activations.cpp` checks them).
 
 Batch training holds out `--val-fraction` (default 10%) of the sequences to
 pick λ from `--reg-grid` and to fit a softmax temperature that is folded into

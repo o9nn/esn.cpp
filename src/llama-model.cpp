@@ -6065,6 +6065,11 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                     // Optional: bias vectors (same length as reservoir).
                     layers[0].bq = create_tensor(tn(LLM_TENSOR_ESN_INPUT_BIAS, "weight"), {reservoir_size}, TENSOR_NOT_REQUIRED);
                     layers[0].bk = create_tensor(tn(LLM_TENSOR_ESN_RESERVOIR_BIAS, "weight"), {reservoir_size}, TENSOR_NOT_REQUIRED);
+
+                    // Optional: the whole input drive of each token,
+                    // s_in·W_in·E[tok] + b_in + b_res + s_fb·W_fb[tok], which
+                    // depends on the token alone. A row lookup like W_fb.
+                    layers[0].esn_input_table = create_tensor(tn(LLM_TENSOR_ESN_INPUT_TABLE, "weight"), {reservoir_size, n_vocab}, TENSOR_NOT_REQUIRED);
                 } break;
             default:
                 throw std::runtime_error("unknown architecture");
@@ -19470,32 +19475,45 @@ struct llm_build_esn : public llm_graph_context_mamba {
         reservoir_state = ggml_reshape_2d(ctx0, reservoir_state, reservoir_size, n_seqs);
         cb(reservoir_state, "esn_state", -1);
 
-        // W_in * inpL: {n_embd, reservoir_size} * {n_embd, n_tokens}
-        //   -> {reservoir_size, n_tokens}
-        // (ggml_mul_mat contracts over ne[0]; see tensor-shape comments in
-        //  the create_tensor block above.)
-        ggml_tensor * u = ggml_mul_mat(ctx0, model.layers[0].wq, inpL);
-        u = ggml_scale(ctx0, u, hparams.esn_input_scaling);
-        // Both biases are constant over time, so they are added to the input
-        // drive once per ubatch rather than once per timestep.
-        if (model.layers[0].bq) {
-            u = ggml_add(ctx0, u, model.layers[0].bq);
-        }
-        if (model.layers[0].bk) {
-            u = ggml_add(ctx0, u, model.layers[0].bk);
-        }
-
-        // Output feedback W_fb·y(t-1). y(t-1) is the one-hot of the token
-        // emitted at t-1, i.e. this step's input token: the sampled token in
-        // generation and the true one in training (teacher forcing), so
-        // scripts/esn_training.py runs the same recurrence. Being a row lookup
-        // that does not depend on the state, it is added to the input drive
-        // for all timesteps at once.
-        if (model.layers[0].wv && feedback_scaling > 0.0f) {
-            GGML_ASSERT(res->t_tokens != nullptr && "ESN output feedback needs token inputs, not embeddings");
+        // The input drive s_in·W_in·u(t) + b_in + b_res + s_fb·W_fb·y(t-1)
+        // does not depend on the state, so it is computed for all timesteps
+        // at once. y(t-1), the one-hot of the token emitted at t-1, is this
+        // step's input token: the sampled token in generation and the true
+        // one in training (teacher forcing), so scripts/esn_training.py runs
+        // the same recurrence.
+        //
+        // With token inputs the drive depends on the token alone, and a model
+        // may store it per token: one row lookup then replaces the projection,
+        // scales and adds, which matters most for single-token decoding, whose
+        // cost at small reservoirs is in the number of graph nodes.
+        ggml_tensor * u = nullptr;
+        if (model.layers[0].esn_input_table && res->t_tokens) {
             // {reservoir_size, n_vocab} rows -> {reservoir_size, n_tokens}
-            ggml_tensor * fb = ggml_get_rows(ctx0, model.layers[0].wv, res->t_tokens);
-            u = ggml_add(ctx0, u, ggml_scale(ctx0, fb, feedback_scaling));
+            u = ggml_get_rows(ctx0, model.layers[0].esn_input_table, res->t_tokens);
+        } else {
+            // W_in * inpL: {n_embd, reservoir_size} * {n_embd, n_tokens}
+            //   -> {reservoir_size, n_tokens}
+            // (ggml_mul_mat contracts over ne[0]; see tensor-shape comments in
+            //  the create_tensor block above.)
+            u = ggml_mul_mat(ctx0, model.layers[0].wq, inpL);
+            if (hparams.esn_input_scaling != 1.0f) {
+                u = ggml_scale(ctx0, u, hparams.esn_input_scaling);
+            }
+            if (model.layers[0].bq) {
+                u = ggml_add(ctx0, u, model.layers[0].bq);
+            }
+            if (model.layers[0].bk) {
+                u = ggml_add(ctx0, u, model.layers[0].bk);
+            }
+            if (model.layers[0].wv && feedback_scaling > 0.0f) {
+                GGML_ASSERT(res->t_tokens != nullptr && "ESN output feedback needs token inputs, not embeddings");
+                // {reservoir_size, n_vocab} rows -> {reservoir_size, n_tokens}
+                ggml_tensor * fb = ggml_get_rows(ctx0, model.layers[0].wv, res->t_tokens);
+                if (feedback_scaling != 1.0f) {
+                    fb = ggml_scale(ctx0, fb, feedback_scaling);
+                }
+                u = ggml_add(ctx0, u, fb);
+            }
         }
         cb(u, "esn_input_proj", -1);
 

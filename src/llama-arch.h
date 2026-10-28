@@ -483,6 +483,7 @@ enum llm_tensor {
     LLM_TENSOR_ESN_FEEDBACK_WEIGHTS,    // output-to-reservoir feedback
     LLM_TENSOR_ESN_INPUT_BIAS,          // reservoir input bias
     LLM_TENSOR_ESN_RESERVOIR_BIAS,      // reservoir bias
+    LLM_TENSOR_ESN_INPUT_TABLE,         // precomputed per-token input drive
 };
 
 enum llm_tensor_layer {

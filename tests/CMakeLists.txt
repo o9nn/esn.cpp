@@ -145,6 +145,10 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-grammar-integration.cpp)
     llama_build_and_test(test-llama-grammar.cpp)
     llama_build_and_test(test-esn.cpp)
+    if (NOT GGML_BACKEND_DL)
+        # calls the CPU backend directly
+        llama_build_and_test(test-esn-activations.cpp)
+    endif()
     # These need model/text arguments at runtime, so build without a CTest:
     #   bin/test-esn-inference <esn.gguf>
     #   bin/test-esn-perplexity <esn.gguf> <text-file>
