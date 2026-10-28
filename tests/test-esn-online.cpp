@@ -367,12 +367,6 @@ int main(int argc, char ** argv) {
 
     // G: in-place readout updates under graph reuse
     {
-        decode_all(ctx, prompt);
-        llama_esn_feedback_event ev = event(LLAMA_ESN_FEEDBACK_CORRECTION, at, &target);
-        assert(llama_esn_submit_feedback(ctx, &ev, 1) == 0);
-        llama_esn_online_params p = mode_params(2, 0.02f, 0.0f);
-        assert(llama_esn_update_readout(ctx, &p) == 1);
-
         // one token at a time from pos 0: same-shaped graphs, reused
         auto step_all = [&]() {
             llama_memory_clear(llama_get_memory(ctx), true);
@@ -385,6 +379,17 @@ int main(int argc, char ** argv) {
             last.assign(l, l + n_vocab);
             return last;
         };
+        // the unadapted baseline for this path: a GPU backend may pick
+        // different kernels for the one-token and the whole-prompt graphs,
+        // so base[at] can differ from it by rounding
+        const auto pristine = step_all();
+
+        decode_all(ctx, prompt);
+        llama_esn_feedback_event ev = event(LLAMA_ESN_FEEDBACK_CORRECTION, at, &target);
+        assert(llama_esn_submit_feedback(ctx, &ev, 1) == 0);
+        llama_esn_online_params p = mode_params(2, 0.02f, 0.0f);
+        assert(llama_esn_update_readout(ctx, &p) == 1);
+
         const auto first = step_all();
         assert(llama_esn_submit_feedback(ctx, &ev, 1) == 0);
         assert(llama_esn_update_readout(ctx, &p) == 1);
@@ -395,7 +400,8 @@ int main(int argc, char ** argv) {
         }
         assert(prob(second, target) > prob(first, target));
         llama_esn_reset_adaptation(ctx);
-        assert(max_abs_diff(step_all(), base[at]) < 1e-5f);
+        assert(max_abs_diff(step_all(), pristine) < 1e-5f);
+        assert(max_abs_diff(pristine, base[at]) < 1e-3f);
         printf("  G  updates apply to reused graphs: ok\n");
     }
 
