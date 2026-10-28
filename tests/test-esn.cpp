@@ -81,6 +81,9 @@ int main() {
         const llm_tensor_info & rb_info  = llm_tensor_info_for(LLM_TENSOR_ESN_RESERVOIR_BIAS);
         assert(rb_info.layer == LLM_TENSOR_LAYER_INPUT);
         assert(rb_info.op == GGML_OP_ADD);
+        const llm_tensor_info & it_info  = llm_tensor_info_for(LLM_TENSOR_ESN_INPUT_TABLE);
+        assert(it_info.layer == LLM_TENSOR_LAYER_INPUT);
+        assert(it_info.op == GGML_OP_GET_ROWS);  // row per input token
         std::cout << "PASSED\n";
     }
 
@@ -148,6 +151,7 @@ int main() {
         std::string feedback_name  = tn(LLM_TENSOR_ESN_FEEDBACK_WEIGHTS);
         std::string input_bias     = tn(LLM_TENSOR_ESN_INPUT_BIAS);
         std::string reservoir_bias = tn(LLM_TENSOR_ESN_RESERVOIR_BIAS);
+        std::string input_table    = tn(LLM_TENSOR_ESN_INPUT_TABLE);
 
         assert(input_name     == "esn_input_weights");
         assert(reservoir_name == "esn_reservoir_weights");
@@ -155,6 +159,7 @@ int main() {
         assert(feedback_name  == "esn_feedback_weights");
         assert(input_bias     == "esn_input_bias");
         assert(reservoir_bias == "esn_reservoir_bias");
+        assert(input_table    == "esn_input_table");
         std::cout << "PASSED\n";
     }
 
