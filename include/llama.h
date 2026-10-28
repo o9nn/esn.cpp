@@ -578,7 +578,8 @@ extern "C" {
     // Positions are tracked per sequence: decoding a position again (after
     // llama_memory_seq_rm or a memory clear) discards what was recorded at
     // and after it, and feedback is refused for positions past the newest one
-    // the context's memory holds.
+    // the context's memory holds or recorded before its content was replaced
+    // (state restore, llama_memory_seq_cp onto the sequence).
     //
 
     enum llama_esn_feedback_type {
@@ -614,7 +615,8 @@ extern "C" {
         float    regularization;    // ridge/RLS: lambda > 0 (pull toward the checkpoint);
                                     // SGD: >= 0, L2 pull toward the checkpoint
         float    decay_rate;        // [0, 1): ridge down-weights a sample by (1 - decay)^age,
-                                    // RLS forgets with factor 1 - decay; unused by SGD
+                                    // RLS forgets samples and the pull toward the
+                                    // checkpoint alike by 1 - decay; unused by SGD
         uint32_t replay_window;     // >= 1: samples kept for ridge, which refits from the
                                     // checkpoint on the newest replay_window samples each update
         bool     freeze_reservoir;  // must be true (-3 otherwise): only W_out is trained

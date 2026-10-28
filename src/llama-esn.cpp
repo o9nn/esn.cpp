@@ -3,6 +3,7 @@
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-model.h"
+#include "llama-memory.h"
 
 #include "ggml-backend.h"
 
@@ -78,14 +79,23 @@ llama_esn_adapter::llama_esn_adapter(const llama_model & model) :
 
 llama_esn_adapter::~llama_esn_adapter() = default;
 
-void llama_esn_adapter::capture(const llama_ubatch & ubatch, uint32_t n_outputs, const float * rows) {
+void llama_esn_adapter::capture(const llama_ubatch & ubatch, uint32_t n_outputs, const float * rows, const llama_memory_i * mem) {
     uint32_t j = 0;
     for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
         const bool is_output = n_outputs == ubatch.n_tokens || (n_outputs > 0 && ubatch.output[i]);
         const float * x = is_output ? rows + (size_t) j++ * n_res : nullptr;
         const llama_pos pos = ubatch.pos[i];
         for (int32_t s = 0; s < ubatch.n_seq_id[i]; ++s) {
-            auto & q = recorded[ubatch.seq_id[i][s]];
+            const llama_seq_id seq = ubatch.seq_id[i][s];
+            auto & rec = recorded[seq];
+            // the memory replaced this sequence's content (restored state,
+            // seq_cp onto it, ...): nothing recorded before belongs to it
+            const uint64_t epoch = mem ? mem->seq_epoch(seq) : 0;
+            if (rec.epoch != epoch) {
+                rec.q.clear();
+                rec.epoch = epoch;
+            }
+            auto & q = rec.q;
             // decoding a position at or before the newest recorded one means
             // the sequence was rewound (seq_rm, memory clear): what was
             // recorded from there on belongs to tokens that are gone, whether
@@ -105,19 +115,23 @@ void llama_esn_adapter::capture(const llama_ubatch & ubatch, uint32_t n_outputs,
     GGML_ASSERT(j == n_outputs);
 }
 
-const llama_esn_adapter::captured * llama_esn_adapter::find(llama_seq_id seq, llama_pos pos) const {
-    const auto it = recorded.find(seq);
-    if (it == recorded.end()) {
+const llama_esn_adapter::captured * llama_esn_adapter::find(llama_seq_id seq, llama_pos pos, const llama_memory_i * mem) const {
+    // positions past the memory's newest one were cleared, and recordings
+    // from before the memory replaced the sequence's content are stale
+    if (mem == nullptr || pos > mem->seq_pos_max(seq)) {
         return nullptr;
     }
-    const auto & q = it->second;
+    const auto it = recorded.find(seq);
+    if (it == recorded.end() || it->second.epoch != mem->seq_epoch(seq)) {
+        return nullptr;
+    }
+    const auto & q = it->second.q;
     const auto c = std::lower_bound(q.begin(), q.end(), pos,
             [](const captured & a, llama_pos p) { return a.pos < p; });
     return c != q.end() && c->pos == pos ? &*c : nullptr;
 }
 
-int32_t llama_esn_adapter::submit(const llama_esn_feedback_event * events, int32_t n_events,
-                                  const std::function<llama_pos(llama_seq_id)> & pos_max) {
+int32_t llama_esn_adapter::submit(const llama_esn_feedback_event * events, int32_t n_events, const llama_memory_i * mem) {
     if (n_events < 0 || (n_events > 0 && events == nullptr)) {
         return -3;
     }
@@ -167,10 +181,10 @@ int32_t llama_esn_adapter::submit(const llama_esn_feedback_event * events, int32
                 LLAMA_LOG_ERROR("%s: event %d: target token %d is out of range\n", __func__, e, tok);
                 return -3;
             }
-            const captured * c = ev.pos + k <= pos_max(ev.seq_id) ? find(ev.seq_id, ev.pos + k) : nullptr;
+            const captured * c = find(ev.seq_id, ev.pos + k, mem);
             if (c == nullptr) {
                 LLAMA_LOG_ERROR("%s: event %d: no readout input recorded for seq %d pos %d (the position "
-                        "was not decoded with an output, was rewound or cleared, or is older than the last %zu)\n",
+                        "was not decoded with an output, was rewound, cleared or replaced, or is older than the last %zu)\n",
                         __func__, e, ev.seq_id, ev.pos + k, recorded_cap);
                 return -3;
             }
@@ -628,10 +642,7 @@ int32_t llama_esn_submit_feedback(
     if (const int32_t rc = llama_esn_check(ctx); rc != 0) {
         return rc;
     }
-    const llama_memory_t mem = ctx->get_memory();
-    return ctx->get_esn()->submit(events, n_events, [mem](llama_seq_id seq) {
-        return mem ? mem->seq_pos_max(seq) : (llama_pos) -1;
-    });
+    return ctx->get_esn()->submit(events, n_events, ctx->get_memory());
 }
 
 int32_t llama_esn_update_readout(

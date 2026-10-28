@@ -685,7 +685,7 @@ model, and every other context on it, keep the checkpoint. Updates:
 | Mode | Objective | Cost per update |
 |------|-----------|-----------------|
 | 0 ridge | `min Σ wᵢ‖T yᵢ − W xᵢ‖² + λ‖W − W₀‖²` over the newest `replay_window` samples, refit from W₀ (Woodbury: an n×n solve for n samples) | O(V·R·n + n³) |
-| 1 RLS | the same objective, recursively from the current W with forgetting `1 − decay_rate`; keeps P = (λI + Σ w x xᵀ)⁻¹ | O(R² + V·R) per sample, R² doubles of memory |
+| 1 RLS | recursively from the current W with forgetting f = `1 − decay_rate`: after k samples `min Σ f^(k−i) wᵢ‖T yᵢ − W xᵢ‖² + f^k λ‖W − W₀‖²`, keeping P = (f^k λI + Σ f^(k−i) w x xᵀ)⁻¹. With decay 0 it is ridge over every sample since the last restart; with decay > 0 the pull toward W₀ fades with the samples (use ridge for a fixed anchor) | O(R² + V·R) per sample, R² doubles of memory |
 | 2 SGD | one weighted cross-entropy step on softmax(W x) per sample, plus `regularization`·(W − W₀) | O(V·R) per sample |
 
 `T` is `esn.output_temperature`: `esn_training.py` fits `W_out` to one-hot
@@ -703,7 +703,9 @@ The adapted readout is not included in `llama_state_*` data.
 Recordings follow the sequence: decoding a position again (after
 `llama_memory_seq_rm` or a memory clear) discards what was recorded at and
 after it, even when the new tokens produce no logits, and feedback is
-refused (-3) for positions past the newest one the context's memory holds.
+refused (-3) for positions past the newest one the context's memory holds,
+and for anything recorded before the memory replaced the sequence's content
+(`llama_state_*set_data`/`load_file`, `llama_memory_seq_cp` onto it).
 A batch of feedback that would overflow `esn.online_learning.buf_size` is
 refused (-5) before anything is copied. If a least-squares solve is
 numerically singular (λ below the rounding of `Σ w x xᵀ`), the update
@@ -730,7 +732,7 @@ the rewind, singular-solve and LoRA rules.
 | Stable dynamics | Spectral radius validated to be in (0, 1) at load time |
 | Non-destructive | Only W_out is adapted; W_res, W_in are read-only |
 | Reversible | `llama_esn_reset_adaptation` returns a context to the checkpoint W_out |
-| Regularized | Ridge and RLS are anchored to the checkpoint by λ‖W − W₀‖²; SGD optionally |
+| Regularized | Ridge is anchored to the checkpoint by λ‖W − W₀‖²; RLS by the same term decayed by `(1 − decay_rate)^k` (fixed at decay 0); SGD optionally |
 
 ### Capability Matrix
 

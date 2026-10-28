@@ -725,6 +725,10 @@ bool llama_context::set_adapter_lora(
         return false;
     }
 
+    const auto it = loras.find(adapter);
+    if (it != loras.end() && it->second == scale) {
+        return true;
+    }
     loras[adapter] = scale;
     // graph reuse compares the adapter set by address only, so a graph built
     // before this change must not be reused
@@ -753,6 +757,11 @@ bool llama_context::rm_adapter_lora(
 void llama_context::clear_adapter_lora() {
     LLAMA_LOG_DEBUG("%s: call\n", __func__);
 
+    // callers such as the server clear before every batch: only an actual
+    // change invalidates the graph
+    if (loras.empty()) {
+        return;
+    }
     loras.clear();
     if (gf_res_prev) {
         gf_res_prev->reset();
@@ -1255,7 +1264,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 ggml_backend_tensor_get_async(backend_x, t_x, esn_rows.data(), 0, esn_rows.size()*sizeof(float));
                 ggml_backend_sched_synchronize(sched.get());
             }
-            esn->capture(ubatch, n_outputs, esn_rows.data());
+            esn->capture(ubatch, n_outputs, esn_rows.data(), memory.get());
         }
 
         n_outputs_prev += n_outputs;

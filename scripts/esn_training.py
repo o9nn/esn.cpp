@@ -1248,6 +1248,9 @@ Examples:
                      "(--train-data) or choose SGD (--online --online-mode sgd)")
     if not (0.0 < args.forgetting_factor <= 1.0):
         parser.error("--forgetting-factor must be in (0, 1]")
+    if args.save_online_metadata and not float(np.float32(1.0 - args.forgetting_factor)) < 1.0:
+        # exported as esn.online_learning.decay (f32), which must be < 1
+        parser.error("--forgetting-factor is too small: 1 - forgetting_factor rounds to 1 in float32")
     if args.bidirectional:
         parser.error("--bidirectional is not supported: at position t the backward "
                      "pass has already read token t+1, the readout's target, and "

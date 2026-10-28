@@ -6,12 +6,12 @@
 
 #include <cstdint>
 #include <deque>
-#include <functional>
 #include <map>
 #include <vector>
 
 struct llama_model;
 struct llama_ubatch;
+struct llama_memory_i;
 
 // Online readout adaptation for an ESN context (the llama_esn_* API).
 //
@@ -28,8 +28,12 @@ struct llama_ubatch;
 //   0 ridge: W = argmin  sum_i w_i |T y_i - W x_i|^2 + lambda |W - W0|^2
 //            over the newest replay_window samples, solved from W0 each time
 //            (Woodbury form, an n x n system for n samples)
-//   1 RLS:   the same objective solved recursively from the current W, with
-//            forgetting factor 1 - decay; P = (lambda I + sum w x x^T)^-1
+//   1 RLS:   solved recursively from the current W with forgetting factor
+//            f = 1 - decay: after k samples, W = argmin  sum_i f^(k-i) w_i
+//            |T y_i - W x_i|^2 + f^k lambda |W - W0|^2, with W0 the readout at
+//            the last restart; P = (f^k lambda I + sum f^(k-i) w x x^T)^-1.
+//            With decay = 0 this is ridge over every sample since the restart;
+//            with decay > 0 the pull toward W0 fades along with old samples
 //   2 SGD:   one cross-entropy step per sample on softmax(W x), weighted by w
 //            (negative w pushes probability away from the token), plus an L2
 //            pull toward W0
@@ -40,13 +44,14 @@ struct llama_esn_adapter {
     // Record the readout inputs of one ubatch, which is called for every
     // ubatch, with or without outputs: each decoded position invalidates what
     // was recorded at or after it. `rows` holds n_outputs vectors of
-    // reservoir_size floats, in ubatch output order.
-    void capture(const llama_ubatch & ubatch, uint32_t n_outputs, const float * rows);
+    // reservoir_size floats, in ubatch output order. `mem` is the context's
+    // memory: a sequence whose content it has since replaced (seq_epoch)
+    // starts over.
+    void capture(const llama_ubatch & ubatch, uint32_t n_outputs, const float * rows, const llama_memory_i * mem);
 
-    // `pos_max(seq)` is the newest position the context's memory holds for
-    // seq; positions after it were cleared and cannot be trained on
-    int32_t submit(const llama_esn_feedback_event * events, int32_t n_events,
-                   const std::function<llama_pos(llama_seq_id)> & pos_max);
+    // Positions past the memory's newest one for the sequence, or recorded
+    // before its content was replaced, cannot be trained on.
+    int32_t submit(const llama_esn_feedback_event * events, int32_t n_events, const llama_memory_i * mem);
     int32_t update (const llama_esn_online_params & params, int n_threads);
     void    reset();
 
@@ -72,8 +77,13 @@ private:
     const int64_t n_res;   // reservoir size: readout input width
     const int64_t n_vocab; // readout output width
 
-    // recorded readout inputs per sequence, oldest first, ascending pos
-    std::map<llama_seq_id, std::deque<captured>> recorded;
+    // recorded readout inputs per sequence, oldest first, ascending pos,
+    // valid for the memory's seq_epoch at the time
+    struct recording {
+        uint64_t             epoch = 0;
+        std::deque<captured> q;
+    };
+    std::map<llama_seq_id, recording> recorded;
     size_t recorded_cap; // per sequence
 
     std::vector<sample> pending; // submitted, not yet trained on
@@ -96,7 +106,7 @@ private:
     float               rls_lambda = 0.0f;
     int                 last_mode  = -1;
 
-    const captured * find(llama_seq_id seq, llama_pos pos) const;
+    const captured * find(llama_seq_id seq, llama_pos pos, const llama_memory_i * mem) const;
 
     void   ensure_readout();
     float * w_data() const;

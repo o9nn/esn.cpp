@@ -232,6 +232,9 @@ int main(int argc, char ** argv) {
 
     printf("test-esn-online: %s\n", synthetic ? "synthetic model" : path_on.c_str());
 
+    // the loaded model's vocabulary: an external model need not have 256
+    const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+
     const std::vector<llama_token> prompt = { 'h', 'e', 'l', 'l', 'o', ' ', 'w', 'o', 'r', 'l', 'd' };
     const llama_pos   at     = 4;
     const llama_token target = 'z';
@@ -259,7 +262,7 @@ int main(int argc, char ** argv) {
 
     const auto base = decode_all(ctx, prompt);
     {
-        const llama_token bad = (llama_token) N_VOCAB;
+        const llama_token bad = (llama_token) n_vocab;
         llama_esn_feedback_event lat = event(LLAMA_ESN_FEEDBACK_LATENCY, at, &target, 12.0f);
         llama_esn_feedback_event oob = event(LLAMA_ESN_FEEDBACK_CORRECTION, at, &bad);
         llama_esn_feedback_event far = event(LLAMA_ESN_FEEDBACK_CORRECTION, (llama_pos) prompt.size(), &target);
@@ -379,7 +382,7 @@ int main(int argc, char ** argv) {
                 assert(llama_decode(ctx, llama_batch_get_one(&t, 1)) == 0);
             }
             const float * l = llama_get_logits_ith(ctx, -1);
-            last.assign(l, l + N_VOCAB);
+            last.assign(l, l + n_vocab);
             return last;
         };
         const auto first = step_all();
@@ -445,6 +448,23 @@ int main(int argc, char ** argv) {
         printf("  I  rewound and cleared positions cannot be trained on: ok\n");
     }
 
+    // L: restoring a saved state replaces the sequence's history
+    {
+        decode_all(ctx, prompt);
+        std::vector<uint8_t> saved(llama_state_get_size(ctx));
+        assert(llama_state_get_data(ctx, saved.data(), saved.size()) == saved.size());
+
+        // a different history ending at the same position
+        std::vector<llama_token> other(prompt.rbegin(), prompt.rend());
+        decode_all(ctx, other);
+        assert(llama_state_set_data(ctx, saved.data(), saved.size()) == saved.size());
+
+        // the recordings are other's, not the restored prompt's
+        llama_esn_feedback_event ev = event(LLAMA_ESN_FEEDBACK_CORRECTION, at, &target);
+        assert(llama_esn_submit_feedback(ctx, &ev, 1) == -3);
+        printf("  L  recordings do not survive a state restore: ok\n");
+    }
+
     // J: a singular solve fails without changing anything
     {
         decode_all(ctx, prompt);
@@ -508,6 +528,6 @@ int main(int argc, char ** argv) {
     std::filesystem::remove(path_off);
     llama_backend_free();
 
-    printf("test-esn-online: PASSED (A..K)\n");
+    printf("test-esn-online: PASSED (A..L)\n");
     return 0;
 }
