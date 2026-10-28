@@ -6035,14 +6035,19 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
 
                     // ESN uses a single "layer" to hold all the weight tensors.
+                    // Everything the recurrence reads is a block-0 tensor so it
+                    // lives on layer 0's device: the per-step W_res·x and the
+                    // input drive it adds must share a backend, or each
+                    // unrolled step becomes another split input. The names
+                    // carry no block number; passing 0 only selects the device.
                     layers.resize(1);
 
                     // W_in: used as ggml_mul_mat(W_in, embd) where embd.ne[0]=n_embd.
                     // So W_in.ne[0]=n_embd, W_in.ne[1]=reservoir_size.
-                    layers[0].wq = create_tensor(tn(LLM_TENSOR_ESN_INPUT_WEIGHTS, "weight"), {n_embd, reservoir_size}, 0);
+                    layers[0].wq = create_tensor(tn(LLM_TENSOR_ESN_INPUT_WEIGHTS, "weight", 0), {n_embd, reservoir_size}, 0);
 
                     // W_res: square recurrent matrix.
-                    layers[0].wk = create_tensor(tn(LLM_TENSOR_ESN_RESERVOIR_WEIGHTS, "weight"), {reservoir_size, reservoir_size}, 0);
+                    layers[0].wk = create_tensor(tn(LLM_TENSOR_ESN_RESERVOIR_WEIGHTS, "weight", 0), {reservoir_size, reservoir_size}, 0);
 
                     // RMS norm weights are per-feature along reservoir axis.
                     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {reservoir_size}, 0);
@@ -6055,16 +6060,16 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                     // Optional: W_fb. The fed-back output is the one-hot of
                     // the input token, so W_fb·y is a row lookup like
                     // tok_embd: ne[0]=reservoir_size, ne[1]=n_vocab.
-                    layers[0].wv = create_tensor(tn(LLM_TENSOR_ESN_FEEDBACK_WEIGHTS, "weight"), {reservoir_size, n_vocab}, TENSOR_NOT_REQUIRED);
+                    layers[0].wv = create_tensor(tn(LLM_TENSOR_ESN_FEEDBACK_WEIGHTS, "weight", 0), {reservoir_size, n_vocab}, TENSOR_NOT_REQUIRED);
 
                     // Optional: bias vectors (same length as reservoir).
-                    layers[0].bq = create_tensor(tn(LLM_TENSOR_ESN_INPUT_BIAS, "weight"), {reservoir_size}, TENSOR_NOT_REQUIRED);
-                    layers[0].bk = create_tensor(tn(LLM_TENSOR_ESN_RESERVOIR_BIAS, "weight"), {reservoir_size}, TENSOR_NOT_REQUIRED);
+                    layers[0].bq = create_tensor(tn(LLM_TENSOR_ESN_INPUT_BIAS, "weight", 0), {reservoir_size}, TENSOR_NOT_REQUIRED);
+                    layers[0].bk = create_tensor(tn(LLM_TENSOR_ESN_RESERVOIR_BIAS, "weight", 0), {reservoir_size}, TENSOR_NOT_REQUIRED);
 
                     // Optional: the whole input drive of each token,
                     // s_in·W_in·E[tok] + b_in + b_res + s_fb·W_fb[tok], which
                     // depends on the token alone. A row lookup like W_fb.
-                    layers[0].esn_input_table = create_tensor(tn(LLM_TENSOR_ESN_INPUT_TABLE, "weight"), {reservoir_size, n_vocab}, TENSOR_NOT_REQUIRED);
+                    layers[0].esn_input_table = create_tensor(tn(LLM_TENSOR_ESN_INPUT_TABLE, "weight", 0), {reservoir_size, n_vocab}, TENSOR_NOT_REQUIRED);
                 } break;
             default:
                 throw std::runtime_error("unknown architecture");
@@ -19481,33 +19486,58 @@ struct llm_build_esn : public llm_graph_context_mamba {
         // may store it per token: one row lookup then replaces the projection,
         // scales and adds, which matters most for single-token decoding, whose
         // cost at small reservoirs is in the number of graph nodes.
+        // The recurrence runs on one backend: the one holding W_res, which
+        // runs every step's W_res·x. Its other ops carry no weights, so the
+        // scheduler would place them by their neighbors: with a readout
+        // offloaded to another backend (op_offload, or the output layer on a
+        // GPU) the stacking ops follow it there, and every per-step state
+        // becomes a separate split input, of which a split may have at most
+        // GGML_SCHED_MAX_SPLIT_INPUTS. Pinning them keeps the loop on one
+        // backend, so only whole tensors cross into and out of it.
+        ggml_backend_t rec_backend = nullptr;
+        if (model.layers[0].wk->buffer) {
+            const ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(model.layers[0].wk->buffer);
+            for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
+                ggml_backend_t b = ggml_backend_sched_get_backend(sched, i);
+                if (ggml_backend_supports_buft(b, buft)) {
+                    rec_backend = b;
+                    break;
+                }
+            }
+        }
+        std::vector<ggml_tensor *> pinned;
+        auto pin = [&](ggml_tensor * t) {
+            pinned.push_back(t);
+            return t;
+        };
+
         ggml_tensor * u = nullptr;
         if (model.layers[0].esn_input_table && res->t_tokens) {
             // {reservoir_size, n_vocab} rows -> {reservoir_size, n_tokens}
-            u = ggml_get_rows(ctx0, model.layers[0].esn_input_table, res->t_tokens);
+            u = pin(ggml_get_rows(ctx0, model.layers[0].esn_input_table, res->t_tokens));
         } else {
             // W_in * inpL: {n_embd, reservoir_size} * {n_embd, n_tokens}
             //   -> {reservoir_size, n_tokens}
             // (ggml_mul_mat contracts over ne[0]; see tensor-shape comments in
             //  the create_tensor block above.)
-            u = ggml_mul_mat(ctx0, model.layers[0].wq, inpL);
+            u = pin(ggml_mul_mat(ctx0, model.layers[0].wq, inpL));
             if (hparams.esn_input_scaling != 1.0f) {
-                u = ggml_scale(ctx0, u, hparams.esn_input_scaling);
+                u = pin(ggml_scale(ctx0, u, hparams.esn_input_scaling));
             }
             if (model.layers[0].bq) {
-                u = ggml_add(ctx0, u, model.layers[0].bq);
+                u = pin(ggml_add(ctx0, u, model.layers[0].bq));
             }
             if (model.layers[0].bk) {
-                u = ggml_add(ctx0, u, model.layers[0].bk);
+                u = pin(ggml_add(ctx0, u, model.layers[0].bk));
             }
             if (model.layers[0].wv && feedback_scaling > 0.0f) {
                 GGML_ASSERT(res->t_tokens != nullptr && "ESN output feedback needs token inputs, not embeddings");
                 // {reservoir_size, n_vocab} rows -> {reservoir_size, n_tokens}
-                ggml_tensor * fb = ggml_get_rows(ctx0, model.layers[0].wv, res->t_tokens);
+                ggml_tensor * fb = pin(ggml_get_rows(ctx0, model.layers[0].wv, res->t_tokens));
                 if (feedback_scaling != 1.0f) {
-                    fb = ggml_scale(ctx0, fb, feedback_scaling);
+                    fb = pin(ggml_scale(ctx0, fb, feedback_scaling));
                 }
-                u = ggml_add(ctx0, u, fb);
+                u = pin(ggml_add(ctx0, u, fb));
             }
         }
         cb(u, "esn_input_proj", -1);
@@ -19527,17 +19557,18 @@ struct llm_build_esn : public llm_graph_context_mamba {
         // vector per input token, laid out [reservoir_size, n_seq_tokens,
         // n_seqs] so it flattens in the order inp_out_ids indexes.
         //
-        // When the CPU is the only backend, each step's state is written into
-        // its row of `states` with ggml_set_rows: one row copy per step. Every
-        // write returns a view of the whole buffer that depends on the
+        // When the recurrence runs on the CPU, each step's state is written
+        // into its row of `states` with ggml_set_rows: one row copy per step.
+        // Every write returns a view of the whole buffer that depends on the
         // previous one, so reading the last sees them all. The row index is a
-        // per-step view of an input, though, and with another backend in the
-        // scheduler each such view becomes a separate split input; more than
-        // GGML_SCHED_MAX_SPLIT_INPUTS of them abort the graph. Then the steps
-        // are concatenated pairwise in a balanced tree instead (each copied
-        // log2(n) times), which keeps every operand on the backend that
-        // computed it.
-        const bool stack_rows = n_seq_tokens > 1 && ggml_backend_sched_get_n_backends(sched) == 1;
+        // per-step view of an input, which lives on the CPU: on any other
+        // backend each such view becomes a separate split input. There the
+        // steps are concatenated pairwise in a balanced tree instead (each
+        // copied log2(n) times), whose operands all stay on the recurrence's
+        // backend.
+        const bool rec_on_cpu = rec_backend == nullptr ||
+            ggml_backend_dev_type(ggml_backend_get_device(rec_backend)) == GGML_BACKEND_DEVICE_TYPE_CPU;
+        const bool stack_rows = n_seq_tokens > 1 && rec_on_cpu;
         std::vector<ggml_tensor *> per_step;
         ggml_tensor * states = nullptr;
         ggml_tensor * steps  = nullptr;
@@ -19565,26 +19596,26 @@ struct llm_build_esn : public llm_graph_context_mamba {
 
             // W_res · x(t): [reservoir_size, reservoir_size] * [reservoir_size, n_seqs]
             //            -> [reservoir_size, n_seqs]
-            ggml_tensor * rec = ggml_mul_mat(ctx0, model.layers[0].wk, state);
+            ggml_tensor * rec = pin(ggml_mul_mat(ctx0, model.layers[0].wk, state));
 
             // Pre-activation = W_res·x + (W_in·u + W_fb·y + b)
-            ggml_tensor * pre = ggml_add(ctx0, rec, u_t);
+            ggml_tensor * pre = pin(ggml_add(ctx0, rec, u_t));
 
-            ggml_tensor * activated = apply_esn_activation(pre, activation_type);
+            ggml_tensor * activated = pin(apply_esn_activation(pre, activation_type));
 
             // Leaky integration (a no-op blend at leaking_rate == 1).
             if (leaking_rate == 1.0f) {
                 state = activated;
             } else {
-                ggml_tensor * leaky_old = ggml_scale(ctx0, state,     1.0f - leaking_rate);
-                ggml_tensor * leaky_new = ggml_scale(ctx0, activated, leaking_rate);
-                state = ggml_add(ctx0, leaky_old, leaky_new);
+                ggml_tensor * leaky_old = pin(ggml_scale(ctx0, state,     1.0f - leaking_rate));
+                ggml_tensor * leaky_new = pin(ggml_scale(ctx0, activated, leaking_rate));
+                state = pin(ggml_add(ctx0, leaky_old, leaky_new));
             }
 
             if (states) {
-                states = ggml_set_rows(ctx0, states,
+                states = pin(ggml_set_rows(ctx0, states,
                     ggml_reshape_3d(ctx0, state, reservoir_size, 1, n_seqs),
-                    ggml_view_1d(ctx0, steps, 1, t * ggml_element_size(steps)));
+                    ggml_view_1d(ctx0, steps, 1, t * ggml_element_size(steps))));
             } else if (n_seq_tokens > 1) {
                 per_step.push_back(state);
             }
@@ -19618,7 +19649,7 @@ struct llm_build_esn : public llm_graph_context_mamba {
                 std::vector<ggml_tensor *> next;
                 next.reserve((level.size() + 1) / 2);
                 for (size_t i = 0; i + 1 < level.size(); i += 2) {
-                    next.push_back(ggml_concat(ctx0, level[i], level[i + 1], 1));
+                    next.push_back(pin(ggml_concat(ctx0, level[i], level[i + 1], 1)));
                 }
                 if (level.size() % 2 == 1) {
                     next.push_back(level.back());
@@ -19628,6 +19659,14 @@ struct llm_build_esn : public llm_graph_context_mamba {
             cur = ggml_reshape_2d(ctx0, level[0], reservoir_size, n_tokens);
         }
         cb(cur, "esn_reservoir_seq", -1);
+
+        if (rec_backend) {
+            for (ggml_tensor * t : pinned) {
+                if (ggml_backend_supports_op(rec_backend, t)) {
+                    ggml_backend_sched_set_tensor_backend(sched, t, rec_backend);
+                }
+            }
+        }
 
         if (inp_out_ids) {
             cur = ggml_get_rows(ctx0, cur, inp_out_ids);

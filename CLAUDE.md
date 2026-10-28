@@ -106,7 +106,7 @@ assert(esn_arch == LLM_ARCH_ESN);
 
 // Test tensor info
 const llm_tensor_info & info = llm_tensor_info_for(LLM_TENSOR_ESN_INPUT_WEIGHTS);
-assert(info.layer == LLM_TENSOR_LAYER_INPUT);
+assert(info.layer == LLM_TENSOR_LAYER_REPEATING);
 ```
 
 ## Training ESN Models
