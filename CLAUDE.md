@@ -22,7 +22,9 @@ x(t+1) = (1-α) * x(t) + α * tanh(W_res * x(t) + W_in * u(t))
 - `src/llama-hparams.h` - ESN hyperparameters (reservoir_size, spectral_radius, etc.)
 - `src/llama-model.cpp` - Model loading and forward pass (`llm_build_esn`)
 - `docs/esn.md` - Comprehensive ESN documentation
+- `src/llama-esn.{h,cpp}` - Online readout adaptation (`llama_esn_*` API)
 - `tests/test-esn.cpp` - ESN architecture tests
+- `tests/test-esn-online.cpp` - Online adaptation tests (ridge/RLS/SGD, reset)
 - `scripts/esn_training.py` - Python utility for ESN training and GGUF creation
 
 ### ESN Hyperparameters
@@ -37,7 +39,8 @@ x(t+1) = (1-α) * x(t) + α * tanh(W_res * x(t) + W_in * u(t))
 | `esn_feedback_scaling` | 0.0 | Output-to-reservoir feedback (0 = disabled) |
 | `esn_noise_level` | 0.0 | Noise injection for regularization |
 | `esn_activation_type` | 0 | Activation: 0=tanh, 1=sigmoid, 2=leaky_relu |
-| `esn_bidirectional` | false | Not supported (inference is forward-only) |
+| `esn_bidirectional` | false | Not supported; the loader refuses it |
+| `esn_output_temperature` | 0 | Scale W_out was fit to (T·one-hot); 0 = not recorded |
 
 ### Tensor Layout
 
@@ -111,8 +114,8 @@ assert(info.layer == LLM_TENSOR_LAYER_INPUT);
 Use the Python training utility:
 
 ```bash
-# Basic training
-python scripts/esn_training.py --reservoir-size 1024 --output model.gguf
+# Basic training (--train-data is required unless --init-only)
+python scripts/esn_training.py --reservoir-size 1024 --train-data corpus.txt --output model.gguf
 
 # With custom config
 python scripts/esn_training.py --config config.json
@@ -130,6 +133,10 @@ python scripts/esn_training.py --reservoir-size 8192 --reg-grid 1,10,100,1000 \
 (`--no-input-table` to omit it); with token inputs the graph reads it instead
 of computing W_in·E + biases + feedback. The CPU `tanh`/`sigmoid` are
 branch-free so they vectorize (`tests/test-esn-activations.cpp` checks them).
+
+`--save-online-metadata` enables the runtime `llama_esn_*` online readout
+adaptation for the exported model; least-squares readouts also record
+`esn.output_temperature`, which the C++ ridge/RLS updates need.
 
 Batch training holds out `--val-fraction` (default 10%) of the sequences to
 pick λ from `--reg-grid` and to fit a softmax temperature that is folded into
@@ -164,8 +171,8 @@ ESN is recognized as recurrent via `llm_arch_is_recurrent()`. To add similar:
 
 Current limitations and planned improvements:
 
-1. **Training Support** - Ridge regression training (see `scripts/esn_training.py`)
-2. **Hierarchical ESNs** - Multi-layer reservoir architectures
+1. **Infer-train loop in CLI/server** - The `llama_esn_*` API exists; no tool drives it yet
+2. **Hierarchical ESNs** - Multi-layer reservoir architectures (keys reserved; refused at load)
 3. **Adaptive Parameters** - Dynamic leaking rate and spectral radius
 4. **Sparse Operations** - Optimized sparse matrix ops for reservoir
 

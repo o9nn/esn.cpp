@@ -123,8 +123,8 @@ Notes on features that live outside the inference path:
   training (`scripts/esn_training.py`) for regularization; omitted from the
   deterministic inference graph
 - **`esn_bidirectional`**: not supported. Inference is causal, and the
-  training script rejects `--bidirectional`; the loader warns when a GGUF
-  sets it
+  training script rejects `--bidirectional` and the loader refuses a GGUF
+  that sets it
 - **`esn_spectral_radius`, `esn_sparsity`**: baked into the reservoir
   weight matrix at training time; the inference graph does not need to see
   them beyond metadata
@@ -268,8 +268,12 @@ ESNs exhibit favorable scaling properties:
    at position t a backward pass has already read it, so backward-pass
    states would leak the target into training and validation while
    inference runs forward only. `esn_training.py` rejects `--bidirectional`
-   and `"bidirectional": true` configs, and the loader warns on GGUF files
+   and `"bidirectional": true` configs, and the loader refuses GGUF files
    that set `esn.bidirectional`.
+7. **One reservoir**: `esn.n_levels` > 1, `esn.lateral_links` and
+   `esn.top_down_mod` describe hierarchical reservoirs that the graph does
+   not build; the loader refuses models that set them rather than running a
+   single reservoir in their place.
 
 ### Best Practices
 
@@ -311,6 +315,7 @@ python scripts/esn_training.py \
     --spectral-radius 0.95 \
     --leaking-rate 0.3 \
     --activation tanh \
+    --train-data corpus.txt \
     --output esn-model.gguf
 
 # 2. Build llama-cli (and the ESN inference smoke test).
@@ -329,16 +334,16 @@ llama.cpp supports. Any input string is split into its UTF-8 bytes and
 each byte becomes its own token, which gives:
 
 - `llama-cli -p "..."` works directly, no extra setup
-- `vocab_size` is pinned to 256 (the script will override larger values
-  with a warning so training/inference stay consistent)
+- `vocab_size` is 256 (the default; any other value is an error with
+  this tokenizer)
 - Round-trip is exact — a model that memorizes a byte-sequence produces
   that sequence back verbatim
 
 For non-text sequence-learning use cases (where the ESN is driven with
 raw token IDs via `llama_batch_get_one`, as in
-`tests/test-esn-inference.cpp`), pass `--tokenizer none` to emit the
-`no_vocab` stub instead. The model loads but `llama-cli -p "..."` will
-not work on it.
+`tests/test-esn-inference.cpp`), pass `--tokenizer none` to write no text
+tokenizer (tokenizer model `no_vocab`). The model loads but `llama-cli -p
+"..."` will not work on it.
 
 Switching to a larger pretrained tokenizer (SPM/BPE) is a straightforward
 extension of `_write_tokenizer()` — call `writer.add_tokenizer_model(...)`,
@@ -396,8 +401,9 @@ ESN training is provided via a Python utility in `scripts/esn_training.py`:
 # Install dependencies
 pip install numpy
 
-# Basic training with sample data
-python scripts/esn_training.py --reservoir-size 1024 --output model.gguf
+# Basic training on a text file (byte-level next-token prediction);
+# --train-data is required unless --init-only
+python scripts/esn_training.py --reservoir-size 1024 --train-data corpus.txt --output model.gguf
 
 # With custom configuration
 python scripts/esn_training.py --config esn_config.json --output trained.gguf
@@ -410,7 +416,7 @@ python scripts/esn_training.py --init-only --reservoir-size 2048 --output untrai
 
 | Parameter | Flag | Default | Description |
 |-----------|------|---------|-------------|
-| Vocabulary Size | `--vocab-size` | 32000 | Token vocabulary size |
+| Vocabulary Size | `--vocab-size` | 256 | Token vocabulary size (256 for the byte tokenizer) |
 | Embedding Dim | `--embedding-dim` | 512 | Input embedding dimension |
 | Reservoir Size | `--reservoir-size` | 1024 | Number of reservoir neurons |
 | Spectral Radius | `--spectral-radius` | 0.95 | Reservoir stability parameter |
@@ -608,7 +614,10 @@ new, separable PRs if they were pursued:
 
 1. **Hierarchical ESNs** — Multi-layer reservoir architectures. See
    `DTECHO.md`, which is a vision document describing a possible
-   Deep-Tree-Echo architecture built *on top of* this ESN runtime.
+   Deep-Tree-Echo architecture built *on top of* this ESN runtime. The
+   `esn.n_levels` / `esn.branching_factor` / `esn.lateral_links` /
+   `esn.top_down_mod` keys are reserved for it; models that set them are
+   refused until it exists.
 2. **Advanced initialization** — Dynamic spectral-radius adaptation.
 3. **Adaptive hyperparameters** — Online tuning of the leaking rate.
 4. **Sparse operations** — A dedicated sparse `ggml_mul_mat` path for
@@ -635,9 +644,57 @@ Token t arrives
     ├─► [Feedback]    Optional feedback event (correction, reward, tool result)
     │                 accumulated in bounded replay buffer
     │
-    └─► [Train step]  Online update of W_out only (O(R²), < 1 ms)
+    └─► [Train step]  llama_esn_update_readout: per-context W_out only
                       Reservoir weights W_res and W_in are NEVER modified
 ```
+
+### Online readout adaptation (C API)
+
+A model exported with `--save-online-metadata` (`esn.online_learning.enabled`)
+makes every context record the readout input `x` (the RMS-normalized state)
+of each position it decodes with logits, keyed by `(seq_id, pos)`; the
+newest `esn.replay_window` positions per sequence are kept. Feedback names a
+position whose logits were read and what the readout should have produced
+there:
+
+```c
+// decode, read logits at position p, sample `tok`, ...
+llama_esn_feedback_event ev = {
+    LLAMA_ESN_FEEDBACK_CORRECTION, /*seq_id*/ 0, /*pos*/ p, /*signal*/ 0.0f,
+    &correct_token, 1,
+};
+llama_esn_submit_feedback(ctx, &ev, 1);
+
+// the mode, rates and window exported with the model, or set your own
+llama_esn_online_params op = llama_esn_model_online_params(model);
+op.update_mode    = 0;      // 0 ridge, 1 RLS, 2 SGD
+op.regularization = 1e-2f;
+llama_esn_update_readout(ctx, &op);   // later decodes on ctx use the new W_out
+// ...
+llama_esn_reset_adaptation(ctx);      // back to the model's W_out
+```
+
+The first update copies `W_out` (dequantized to F32) into a buffer owned by
+the context, which the graph then reads instead of the model tensor; the
+model, and every other context on it, keep the checkpoint. Updates:
+
+| Mode | Objective | Cost per update |
+|------|-----------|-----------------|
+| 0 ridge | `min Σ wᵢ‖T yᵢ − W xᵢ‖² + λ‖W − W₀‖²` over the newest `replay_window` samples, refit from W₀ (Woodbury: an n×n solve for n samples) | O(V·R·n + n³) |
+| 1 RLS | the same objective, recursively from the current W with forgetting `1 − decay_rate`; keeps P = (λI + Σ w x xᵀ)⁻¹ | O(R² + V·R) per sample, R² doubles of memory |
+| 2 SGD | one weighted cross-entropy step on softmax(W x) per sample, plus `regularization`·(W − W₀) | O(V·R) per sample |
+
+`T` is `esn.output_temperature`: `esn_training.py` fits `W_out` to one-hot
+targets and folds the calibrated softmax temperature into it, so the
+exported readout is fit to `T · onehot` and ridge/RLS keep that scale. A
+readout without the key (SGD-trained or untrained) can only be adapted with
+SGD. Corrections and tool results are samples of weight 1; rewards weight
+the emitted token by the reward (negative only with SGD); confidence
+weights it by a value in [0, 1]. Latency events are rejected: they carry
+no token target. A readout stored repacked for the CPU kernels cannot be
+read back; load such models with `use_extra_bufts = false` (`--no-repack`).
+The adapted readout is not included in `llama_state_*` data.
+`tests/test-esn-online.cpp` checks each mode against its closed form.
 
 **Proprioceptive feedback**: Signals originating from the model's own execution context:
 - `CORRECTION` — explicit user or verifier correction
@@ -650,11 +707,11 @@ Token t arrives
 
 | Invariant | Guarantee |
 |-----------|-----------|
-| Bounded latency | Train step completes in < 1 ms for R ≤ 4096 on CPU |
+| Bounded cost | Train step cost is set by the mode (table above), independent of context length |
 | Stable dynamics | Spectral radius validated to be in (0, 1) at load time |
 | Non-destructive | Only W_out is adapted; W_res, W_in are read-only |
-| Reproducible | State + W_out can be checkpointed and restored at any time |
-| Safe | Updates bounded by L2 regularisation; drift detection + rollback available |
+| Reversible | `llama_esn_reset_adaptation` returns a context to the checkpoint W_out |
+| Regularized | Ridge and RLS are anchored to the checkpoint by λ‖W − W₀‖²; SGD optionally |
 
 ### Capability Matrix
 
@@ -664,8 +721,8 @@ Token t arrives
 | Parameter validation at load | ✅ |
 | Online RLS/SGD (Python) | ✅ |
 | Online learning GGUF metadata | ✅ |
-| Proprioceptive feedback API (C stubs) | ✅ |
-| Synchronous infer-train runtime loop | 🔄 Phase 4 |
+| Feedback API + online readout updates (C, ridge/RLS/SGD) | ✅ |
+| Synchronous infer-train runtime loop (in a CLI/server) | 🔄 Phase 4 |
 | Hierarchical reservoir (DTE) | 🔄 Phase 6 |
 | ESN–Transformer hybrid | 🔄 Phase 7 |
 | Safety governance + rollback | 🔄 Phase 8 |

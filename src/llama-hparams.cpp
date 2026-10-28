@@ -2,6 +2,7 @@
 
 #include "ggml.h"
 #include <cassert>
+#include <cmath>
 #include <stdexcept>
 #include <string>
 
@@ -299,6 +300,11 @@ void llama_hparams::validate_esn_params() const {
                 "ESN: esn_online_reg must be >= 0, got " +
                 std::to_string(esn_online_reg));
         }
+        if (esn_online_update_mode != 2 && esn_online_reg <= 0.0f) {
+            throw std::invalid_argument(
+                "ESN: esn_online_reg must be > 0 for ridge and RLS updates, got " +
+                std::to_string(esn_online_reg));
+        }
         if (esn_online_update_mode > 2) {
             throw std::invalid_argument(
                 "ESN: esn_online_update_mode must be 0 (batch_ridge), 1 (rls), or 2 (sgd), got " +
@@ -311,11 +317,30 @@ void llama_hparams::validate_esn_params() const {
         }
     }
 
-    // Hierarchical parameters
+    if (esn_output_temperature < 0.0f || !std::isfinite(esn_output_temperature)) {
+        throw std::invalid_argument(
+            "ESN: esn.output_temperature must be finite and > 0 when present, got " +
+            std::to_string(esn_output_temperature));
+    }
+
+    // The graph runs one forward reservoir. Configurations it cannot run are
+    // refused instead of being executed as something else.
+    if (esn_bidirectional) {
+        throw std::invalid_argument(
+            "ESN: esn.bidirectional is set, but inference runs the reservoir forward only "
+            "(a backward pass would read tokens that have not been generated yet)");
+    }
     if (esn_n_levels == 0) {
         throw std::invalid_argument("ESN: esn_n_levels must be >= 1");
     }
-    if (esn_n_levels > 1 && esn_branching_factor == 0) {
-        throw std::invalid_argument("ESN: esn_branching_factor must be >= 1 for hierarchical ESN (n_levels > 1)");
+    if (esn_n_levels > 1 || esn_lateral_links || esn_top_down_mod) {
+        throw std::invalid_argument(
+            "ESN: hierarchical reservoirs (esn.n_levels > 1, esn.lateral_links, "
+            "esn.top_down_mod) are not implemented; this build runs a single reservoir");
+    }
+    if (esn_online_learning && !esn_freeze_reservoir) {
+        throw std::invalid_argument(
+            "ESN: esn.freeze_reservoir = false is not supported; online learning "
+            "updates the readout only");
     }
 }

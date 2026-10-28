@@ -2064,6 +2064,7 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                 ml.get_key(LLM_KV_ESN_NOISE_LEVEL,      hparams.esn_noise_level, false);
                 ml.get_key(LLM_KV_ESN_ACTIVATION_TYPE,  hparams.esn_activation_type, false);
                 ml.get_key(LLM_KV_ESN_BIDIRECTIONAL,    hparams.esn_bidirectional, false);
+                ml.get_key(LLM_KV_ESN_OUTPUT_TEMPERATURE, hparams.esn_output_temperature, false);
 
                 // Online learning configuration (optional, defaults to disabled)
                 ml.get_key(LLM_KV_ESN_ONLINE_LEARNING_ENABLED, hparams.esn_online_learning,    false);
@@ -2085,12 +2086,6 @@ void llama_model::load_hparams(llama_model_loader & ml) {
 
                 // Validate all ESN parameters now that they are loaded
                 hparams.validate_esn_params();
-
-                if (hparams.esn_bidirectional) {
-                    LLAMA_LOG_WARN("%s: esn.bidirectional is set, but inference runs the reservoir forward only; "
-                        "a readout trained on backward-pass states saw the next token and scores worse than "
-                        "its training metrics\n", __func__);
-                }
 
                 switch (hparams.n_layer) {
                     case 1: type = LLM_TYPE_SMALL; break;
@@ -19608,10 +19603,16 @@ struct llm_build_esn : public llm_graph_context_mamba {
         cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
         cb(cur, "result_norm", -1);
         res->t_embd = cur;
+        if (esn_capture) {
+            // the context reads the readout input back for online adaptation
+            ggml_set_output(cur);
+        }
 
         // W_out · x : [reservoir_size, n_vocab] * [reservoir_size, n_out]
         //         -> [n_vocab, n_out]
-        cur = build_lora_mm(model.output, cur);
+        // A context that has adapted its readout (llama_esn_update_readout)
+        // supplies its own copy of W_out.
+        cur = build_lora_mm(esn_readout ? esn_readout : model.output, cur);
         cb(cur, "result_output", -1);
         res->t_logits = cur;
 

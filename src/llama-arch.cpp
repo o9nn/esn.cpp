@@ -273,6 +273,7 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_ESN_NOISE_LEVEL,       "esn.noise_level"       },
     { LLM_KV_ESN_ACTIVATION_TYPE,   "esn.activation_type"   },
     { LLM_KV_ESN_BIDIRECTIONAL,     "esn.bidirectional"     },
+    { LLM_KV_ESN_OUTPUT_TEMPERATURE, "esn.output_temperature" },
 
     // Online learning / infer-train
     { LLM_KV_ESN_ONLINE_LEARNING_ENABLED, "esn.online_learning.enabled"  },

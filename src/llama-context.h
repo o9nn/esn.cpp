@@ -22,6 +22,8 @@ struct llama_memory_i;
 struct llama_memory_context_i;
 
 // "memory" as in physical memory for a buffer type, in bytes
+struct llama_esn_adapter;
+
 struct llama_memory_breakdown_data {
     size_t model   = 0; // memory allocated for the model
     size_t context = 0; // memory allocated for the context
@@ -53,6 +55,10 @@ struct llama_context {
     uint32_t n_threads_batch() const;
 
     llama_memory_t get_memory() const;
+
+    // online readout adaptation state; nullptr unless the model is an ESN
+    // with esn.online_learning.enabled
+    llama_esn_adapter * get_esn() const;
 
     // return true if the memory was updated
     bool memory_update(bool optimize);
@@ -237,6 +243,9 @@ private:
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 
     std::unique_ptr<llama_memory_i> memory;
+
+    std::unique_ptr<llama_esn_adapter> esn;
+    std::vector<float>                 esn_rows; // readout inputs of the last ubatch
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     size_t  logits_size = 0; // capacity (of floats) for logits

@@ -146,11 +146,14 @@ struct llama_hparams {
     bool     esn_feedback_token   = false;   // fed-back output is the input token's one-hot
     float    esn_noise_level      = 0.0f;    // noise injection for regularization
     uint32_t esn_activation_type  = 0;       // 0=tanh, 1=sigmoid, 2=leaky_relu
-    bool     esn_bidirectional    = false;   // unsupported (inference is causal); loader warns
+    bool     esn_bidirectional    = false;   // unsupported (inference is causal); loader rejects it
+    // softmax temperature folded into W_out by training: the readout was fit
+    // to temperature * one-hot targets (0 = not recorded in the GGUF)
+    float    esn_output_temperature = 0.0f;
 
     // ESN online learning / infer-train (Phase 3)
     bool     esn_online_learning    = false;  // enable online readout adaptation
-    float    esn_online_lr          = 1e-4f;  // online learning rate for RLS/SGD
+    float    esn_online_lr          = 1e-4f;  // online learning rate (SGD)
     float    esn_online_reg         = 1e-6f;  // L2 regularization coefficient
     uint32_t esn_online_buffer_size = 64;     // experience replay buffer capacity (tokens)
     uint32_t esn_online_update_mode = 0;      // 0=batch_ridge, 1=rls, 2=sgd

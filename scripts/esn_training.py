@@ -74,7 +74,7 @@ class ESNConfig:
 
     def __init__(
         self,
-        vocab_size: int = 32000,
+        vocab_size: int = 256,
         embedding_dim: int = 512,
         reservoir_size: int = 1024,
         spectral_radius: float = 0.95,
@@ -108,11 +108,8 @@ class ESNConfig:
         self.seed = seed
         self.tokenizer = tokenizer  # "byte" | "none"
         if self.tokenizer == "byte" and self.vocab_size != 256:
-            # Byte tokenizer must have vocab == 256. Auto-correct and warn
-            # rather than silently producing a broken model.
-            logger.warning(f"[ESNConfig] tokenizer='byte' requires vocab_size=256; "
-                           f"overriding vocab_size {self.vocab_size} -> 256")
-            self.vocab_size = 256
+            raise ValueError(f"tokenizer='byte' has 256 tokens, but vocab_size is {self.vocab_size}; "
+                             f"use vocab_size=256 or tokenizer='none'")
 
     @classmethod
     def from_json(cls, path: str) -> "ESNConfig":
@@ -293,6 +290,12 @@ class ESN:
         # probability scale; inference treats it as logits. train() fits this
         # scale on held-out data and save_gguf() folds it into W_out.
         self.output_temperature = 1.0
+        # True once W_out is a least-squares fit (batch ridge or RLS) to
+        # output_temperature * one-hot targets; save_gguf() then records that
+        # scale as esn.output_temperature, which llama.cpp's online ridge and
+        # RLS updates continue from. An SGD-trained or untrained readout has
+        # no such target scale and the key is left out.
+        self.readout_is_least_squares = False
         # Type the reservoir matrix is stored in by save_gguf().
         self.reservoir_type = "f32"
 
@@ -663,6 +666,7 @@ class ESN:
         logger.info(f"Training output weights on {n_rows} samples "
                     f"(state dim: {self.config.reservoir_size}, ridge penalty {lam:.3g})...")
         self.W_out = self._ridge_solve(XtX, XtY, lam)
+        self.readout_is_least_squares = True
 
         accuracy = float(np.mean(np.argmax(X_fit @ self.W_out.T, axis=1) == y_fit))
         logger.info(f"Training complete. Accuracy: {accuracy:.4f}"
@@ -879,6 +883,8 @@ class ESN:
           - ``esn.noise_level``      (float32, optional)
           - ``esn.activation_type``  (uint32, optional: 0=tanh, 1=sigmoid, 2=leaky_relu)
           - ``esn.bidirectional``    (bool, optional; always false)
+          - ``esn.output_temperature`` (float32, when W_out is a least-squares
+            fit: the scale of its one-hot targets, folded into W_out)
           - ``esn.attention.layernorm_rms_eps`` (float32, required by loader)
 
         Tensors emitted (``.weight`` suffix per llama.cpp convention):
@@ -919,9 +925,9 @@ class ESN:
         #     text-prompt path: any input string is split into its UTF-8
         #     bytes, each mapped to its byte-id. Requires vocab_size == 256.
         #
-        #   - "none": emits the "no_vocab" stub. The model loads but text
-        #     tokenization is unavailable; drive it with raw token IDs via
-        #     llama_batch_get_one. Useful when the ESN is being used as a
+        #   - "none": writes tokenizer model "no_vocab" (llama.cpp's
+        #     LLAMA_VOCAB_TYPE_NONE). The model has no text tokenizer; drive
+        #     it with raw token IDs via llama_batch_get_one, e.g. as a
         #     non-text sequence learner.
         #
         self._write_tokenizer(writer)
@@ -940,6 +946,8 @@ class ESN:
         writer.add_float32("esn.noise_level",      self.config.noise_level)
         writer.add_uint32("esn.activation_type",   self.config.activation_type)
         writer.add_bool("esn.bidirectional",       self.config.bidirectional)
+        if self.readout_is_least_squares:
+            writer.add_float32("esn.output_temperature", self.output_temperature)
 
         if self.config.online_learning:
             writer.add_bool("esn.online_learning.enabled", True)
@@ -1016,7 +1024,8 @@ class ESN:
           - "byte": a 256-token byte-level tokenizer using the RWKV escape
             format. Any text input is split into UTF-8 bytes and each byte
             becomes its own token. llama-cli -p "..." works.
-          - "none": the "no_vocab" stub. Load-only, raw-token-id driven.
+          - "none": tokenizer model "no_vocab"; the model is driven by raw
+            token IDs.
         """
         mode = self.config.tokenizer
 
@@ -1060,28 +1069,6 @@ class ESN:
         # No BOS/EOS by default — users can set these via CLI if needed.
         writer.add_add_bos_token(False)
         writer.add_add_eos_token(False)
-
-
-def create_sample_training_data(
-    vocab_size: int,
-    n_sequences: int = 1000,
-    seq_length: int = 128,
-    seed: int = 42
-) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Create sample training data for testing.
-
-    In practice, you would load real tokenized text data here.
-    """
-    rng = np.random.default_rng(seed)
-
-    # Random token sequences (replace with real data)
-    input_seqs = rng.integers(0, vocab_size, (n_sequences, seq_length))
-
-    # Target is next token prediction (shifted by 1)
-    target_seqs = np.roll(input_seqs, -1, axis=1)
-
-    return input_seqs, target_seqs
 
 
 def load_text_training_data(
@@ -1143,21 +1130,21 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Basic batch ridge regression training
-  python esn_training.py --reservoir-size 1024 --output model.gguf
+  # Basic batch ridge regression training on a text file
+  python esn_training.py --reservoir-size 1024 --train-data corpus.txt --output model.gguf
 
   # With sigmoid activation and bias
-  python esn_training.py --reservoir-size 2048 --activation sigmoid --use-bias
+  python esn_training.py --reservoir-size 2048 --activation sigmoid --use-bias --train-data corpus.txt
 
   # Generative ESN with feedback
-  python esn_training.py --reservoir-size 1024 --feedback-scaling 0.5
+  python esn_training.py --reservoir-size 1024 --feedback-scaling 0.5 --train-data corpus.txt
 
   # Online RLS training (infer-train / ESLLM)
-  python esn_training.py --reservoir-size 1024 --online --online-mode rls \\
+  python esn_training.py --reservoir-size 1024 --train-data corpus.txt --online --online-mode rls \\
       --forgetting-factor 0.999 --output online_model.gguf
 
   # Online SGD training
-  python esn_training.py --reservoir-size 1024 --online --online-mode sgd \\
+  python esn_training.py --reservoir-size 1024 --train-data corpus.txt --online --online-mode sgd \\
       --online-lr 1e-4 --output online_sgd_model.gguf
         """
     )
@@ -1168,7 +1155,8 @@ Examples:
                         help="Output GGUF file path")
 
     # ESN hyperparameters
-    parser.add_argument("--vocab-size", type=int, default=32000)
+    parser.add_argument("--vocab-size", type=int, default=256,
+                        help="Vocabulary size; the byte tokenizer has 256 tokens")
     parser.add_argument("--embedding-dim", type=int, default=512)
     parser.add_argument("--reservoir-size", type=int, default=1024)
     parser.add_argument("--spectral-radius", type=float, default=0.95)
@@ -1195,8 +1183,8 @@ Examples:
 
     # Training options
     parser.add_argument("--train-data", type=str, help="Path to training data")
-    parser.add_argument("--n-sequences", type=int, default=1000,
-                        help="Number of sequences for sample data")
+    parser.add_argument("--n-sequences", type=int, default=None,
+                        help="Use at most this many training windows (default: all)")
     parser.add_argument("--seq-length", type=int, default=128)
     parser.add_argument("--washout", type=int, default=100)
     parser.add_argument("--val-fraction", type=float, default=0.1,
@@ -1220,8 +1208,8 @@ Examples:
     parser.add_argument("--tokenizer", choices=["byte", "none"], default="byte",
                         help="Tokenizer type. 'byte' (default) emits a 256-"
                              "token byte-level tokenizer so llama-cli -p "
-                             "\"text\" works. 'none' emits the no_vocab stub "
-                             "for raw-token-id driven use.")
+                             "\"text\" works. 'none' writes no text tokenizer "
+                             "(tokenizer model no_vocab), for raw-token-id use.")
 
     # Online learning options (Phase 3 – ESLLM infer-train substrate)
     parser.add_argument("--online", action="store_true",
@@ -1239,7 +1227,7 @@ Examples:
                         help="L2 weight decay for online SGD")
     parser.add_argument("--save-online-metadata", action="store_true",
                         help="Embed online-learning config in GGUF metadata so llama.cpp "
-                             "enables adaptation at runtime")
+                             "enables readout adaptation (llama_esn_*) at runtime")
 
     # Modes
     parser.add_argument("--init-only", action="store_true",
@@ -1249,6 +1237,11 @@ Examples:
 
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(message)s")
+    if not args.init_only and not args.train_data:
+        parser.error("--train-data is required to train the readout "
+                     "(use --init-only to write untrained random weights)")
+    if not (0.0 < args.forgetting_factor <= 1.0):
+        parser.error("--forgetting-factor must be in (0, 1]")
     if args.bidirectional:
         parser.error("--bidirectional is not supported: at position t the backward "
                      "pass has already read token t+1, the readout's target, and "
@@ -1297,20 +1290,13 @@ Examples:
     esn.set_reservoir_type(args.outtype)
 
     if not args.init_only:
-        # Load or create training data
-        if args.train_data:
-            logger.info(f"Loading training data from {args.train_data}")
-            input_seqs, target_seqs = load_text_training_data(
-                args.train_data,
-                config.vocab_size,
-                seq_length=args.seq_length,
-                max_sequences=args.n_sequences,
-            )
-        else:
-            logger.info("Using sample training data (for testing only)")
-            input_seqs, target_seqs = create_sample_training_data(
-                config.vocab_size, args.n_sequences, args.seq_length, config.seed
-            )
+        logger.info(f"Loading training data from {args.train_data}")
+        input_seqs, target_seqs = load_text_training_data(
+            args.train_data,
+            config.vocab_size,
+            seq_length=args.seq_length,
+            max_sequences=args.n_sequences,
+        )
 
         if args.online:
             # ---------------------------------------------------------- #
@@ -1344,24 +1330,8 @@ Examples:
             mean_loss = total_loss / max(total_updates, 1)
             logger.info(f"\nOnline training complete.  "
                         f"Total updates: {total_updates}  Mean loss: {mean_loss:.4f}")
-
-            # Embed online-learning metadata in the GGUF file if requested
-            if args.save_online_metadata:
-                config.online_learning      = True
-                config.online_lr            = args.online_lr
-                config.online_reg           = args.online_reg
-                config.online_buffer_size   = 64
-                config.online_update_mode   = 0 if args.online_mode == "rls" else 2
-                # decay_rate is the complement of the forgetting factor, clamped to [0, 1)
-                # A forgetting_factor of 1.0 means no forgetting → decay_rate = 0.0
-                # A forgetting_factor approaching 0.0 means fast forgetting → decay_rate approaches 1.0
-                # We clamp to < 1.0 to satisfy the validation constraint.
-                raw_decay = 1.0 - args.forgetting_factor
-                config.online_decay_rate    = min(max(raw_decay, 0.0), 0.9999)
-                config.freeze_reservoir     = True
-                config.replay_window        = 256
-                esn.config = config
-                logger.info("Online learning metadata will be embedded in GGUF.")
+            # RLS fits W_out to one-hot targets (scale 1); SGD fits logits
+            esn.readout_is_least_squares = args.online_mode == "rls"
         else:
             # Batch ridge regression (original mode)
             reg_grid = None
@@ -1372,6 +1342,27 @@ Examples:
                                  calibrate=not args.no_calibrate,
                                  reg_grid=reg_grid)
             logger.info(f"Final training accuracy: {accuracy:.4f}")
+
+    # Embed the online-adaptation config, which enables llama_esn_* on the
+    # model in llama.cpp. The mode is the one llama.cpp should use: 0 batch
+    # ridge, 1 RLS, 2 SGD (ridge and RLS need a least-squares readout).
+    if args.save_online_metadata:
+        if args.online and args.online_mode == "sgd":
+            mode = 2
+        elif args.online:
+            mode = 1
+        else:
+            mode = 0
+        config.online_learning    = True
+        config.online_lr          = args.online_lr
+        config.online_reg         = args.online_reg
+        config.online_buffer_size = 64
+        config.online_update_mode = mode
+        config.online_decay_rate  = 1.0 - args.forgetting_factor
+        config.freeze_reservoir   = True
+        config.replay_window      = 256
+        esn.config = config
+        logger.info("Online learning metadata will be embedded in GGUF.")
 
     # Save to GGUF
     esn.save_gguf(args.output, input_table=not args.no_input_table)
